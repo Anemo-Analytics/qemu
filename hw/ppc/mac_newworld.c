@@ -63,6 +63,7 @@
 #include "hw/nvram/fw_cfg.h"
 #include "hw/char/escc.h"
 #include "hw/misc/macio/macio.h"
+#include "hw/misc/unimp.h"
 #include "hw/ppc/openpic.h"
 #include "hw/loader.h"
 #include "hw/fw-path-provider.h"
@@ -74,6 +75,107 @@
 #include "hw/usb.h"
 #include "hw/sysbus.h"
 #include "trace.h"
+
+/*
+ * Minimal MPC5200 MMIO stub for VxWorks BSP emulation.
+ *
+ * I2C2 registers at MBAR+0x3d40:
+ *   +0x00 MADR (address)
+ *   +0x04 MFDR (frequency divider)
+ *   +0x08 MBCR (control) - write START here to begin transfer
+ *   +0x0c MBSR (status)  - bit7=MIF(done), bit1=MCF(complete) -> 0x82
+ *   +0x10 MDBR (data)    - read returns next EEPROM byte
+ *
+ * We return a synthetic version-4 EEPROM image (72 bytes):
+ *   [0:4]   CRC32 over bytes 4..64
+ *   [4:8]   version = 4
+ *   [8:12]  size = 0x3c (60-byte data section)
+ *   [12:72] 60 bytes data; byte 19 = board type 23 (CT6003_Motherboard_V3)
+ */
+static const uint8_t mpc5200_eeprom[72] = {
+    /* checksum */  0xb8, 0xe1, 0xde, 0x02,
+    /* version  */  0x00, 0x00, 0x00, 0x04,
+    /* size     */  0x00, 0x00, 0x00, 0x3c,
+    /* data[0..6] */  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    /* data[7] board type 23 = CT6003_Motherboard_V3 */ 0x17,
+    /* data[8..59] */ 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                      0x00, 0x00, 0x00, 0x00,
+};
+
+static unsigned int mpc5200_i2c_byte = 0;
+
+/* Log MMIO accesses outside well-known ranges to help trace kernel behavior */
+static void mpc5200_log_access(const char *rw, hwaddr offset, uint64_t val, unsigned size)
+{
+    static uint64_t log_count = 0;
+    if (log_count < 2000 && 0) { /* disabled temporarily */
+        fprintf(stderr, "MPC5200 %s off=0x%05x sz=%u val=0x%08x\n",
+                rw, (unsigned)offset, size, (unsigned)val);
+        log_count++;
+        if (log_count == 2000) {
+            fprintf(stderr, "MPC5200: log limit reached, suppressing further\n");
+        }
+        fflush(stderr);
+    }
+}
+
+static uint64_t mpc5200_mmio_read(void *opaque, hwaddr offset, unsigned size)
+{
+    /* I2C1 SR=0x3d0c, I2C2 SR=0x3d4c: MCF+MIF set = transfer complete */
+    if (offset == 0x3d0c || offset == 0x3d4c) {
+        return 0x82000000;
+    }
+    /* I2C2 data register: return next EEPROM byte */
+    if (offset == 0x3d50) {
+        uint8_t b = mpc5200_eeprom[mpc5200_i2c_byte % sizeof(mpc5200_eeprom)];
+        mpc5200_i2c_byte++;
+        return (uint64_t)b << 24; /* BE: byte in MSB position */
+    }
+    /*
+     * PSC1-6 Status Registers (SR at PSCn_base+4):
+     *   PSC1: MBAR+0x2004, PSC2: 0x2204, PSC3: 0x2404, ...
+     * Return TxRDY=bit5 + TxEMP=bit4 = 0x30 in the SR byte.
+     * Also return TxRDY for FIFO status and similar registers.
+     */
+    if (offset >= 0x2000 && offset < 0x2c00) {
+        return 0x30303030; /* all bytes = TxRDY+TxEMP set */
+    }
+    mpc5200_log_access("R", offset, 0, size);
+    return 0;
+}
+
+static void mpc5200_mmio_write(void *opaque, hwaddr offset,
+                               uint64_t value, unsigned size)
+{
+    /* Reset EEPROM byte counter when BSP initiates a new I2C transfer */
+    if (offset == 0x3d48 && (value & 0x10000000)) { /* MBCR2 START bit */
+        mpc5200_i2c_byte = 0;
+        return;
+    }
+    /* PSC TX data: PSCn at MBAR+0x2000, TX buffer at PSCn+0x0c */
+    if (offset >= 0x2000 && offset < 0x2c00) {
+        if ((offset & 0xff) == 0x0c) {
+            uint8_t ch = value & 0xff;
+            fprintf(stderr, "PSC_TX[%04x]: 0x%02x '%c'\n",
+                    (unsigned)offset, ch, (ch >= 0x20 && ch < 0x7f) ? ch : '.');
+            fflush(stderr);
+        }
+        return;
+    }
+    mpc5200_log_access("W", offset, value, size);
+}
+
+static const MemoryRegionOps mpc5200_mmio_ops = {
+    .read  = mpc5200_mmio_read,
+    .write = mpc5200_mmio_write,
+    .endianness = DEVICE_BIG_ENDIAN,
+    .valid = { .min_access_size = 1, .max_access_size = 4 },
+};
 
 #define MAX_IDE_BUS 2
 #define CFG_ADDR 0xf0000510
@@ -140,6 +242,8 @@ static void ppc_core99_init(MachineState *machine)
     int i, j, k, ppc_boot_device, machine_arch, bios_size = -1;
     const char *bios_name = machine->firmware ?: PROM_FILENAME;
     MemoryRegion *bios = g_new(MemoryRegion, 1);
+    MemoryRegion *sram = g_new(MemoryRegion, 1);
+    MemoryRegion *mpc5200 = g_new(MemoryRegion, 1);
     hwaddr kernel_base = 0, initrd_base = 0, cmdline_base = 0;
     long kernel_size = 0, initrd_size = 0;
     PCIBus *pci_bus;
@@ -468,6 +572,15 @@ static void ppc_core99_init(MachineState *machine)
     sysbus_realize_and_unref(s, &error_fatal);
     sysbus_mmio_map(s, 0, CFG_ADDR);
     sysbus_mmio_map(s, 1, CFG_ADDR + 2);
+
+    /* MPC5200 MBAR region: custom stub returning plausible I2C status values */
+    memory_region_init_io(mpc5200, NULL, &mpc5200_mmio_ops, NULL,
+                          "mpc5200-mmio", 1 * MiB);
+    memory_region_add_subregion(get_system_memory(), 0xf0000000, mpc5200);
+
+    /* MPC5200 internal SRAM at 0x601f8000 (64 KiB) */
+    memory_region_init_ram(sram, NULL, "mpc5200-sram", 64 * KiB, &error_fatal);
+    memory_region_add_subregion(get_system_memory(), 0x601f8000, sram);
 
     fw_cfg_add_i16(fw_cfg, FW_CFG_NB_CPUS, (uint16_t)machine->smp.cpus);
     fw_cfg_add_i16(fw_cfg, FW_CFG_MAX_CPUS, (uint16_t)machine->smp.max_cpus);
