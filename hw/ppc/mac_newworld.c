@@ -49,6 +49,7 @@
 #include "qemu/osdep.h"
 #include "qemu/datadir.h"
 #include "qemu/units.h"
+#include "qemu/timer.h"
 #include "qapi/error.h"
 #include "hw/ppc/ppc.h"
 #include "hw/qdev-properties.h"
@@ -107,7 +108,27 @@ static const uint8_t mpc5200_eeprom[72] = {
                       0x00, 0x00, 0x00, 0x00,
 };
 
-static unsigned int mpc5200_i2c_byte = 0;
+typedef struct {
+    MemoryRegion  mr;
+    QEMUTimer    *timer;
+    PowerPCCPU   *cpu;
+    bool          ic_pending;
+    unsigned int  i2c_byte;
+} MPC5200State;
+
+static void mpc5200_tick(void *opaque)
+{
+    MPC5200State *s = opaque;
+    static int tick_count = 0;
+    if (tick_count++ < 3) {
+        fprintf(stderr, "MPC5200: tick #%d, asserting EXT\n", tick_count);
+        fflush(stderr);
+    }
+    s->ic_pending = true;
+    ppc_set_irq(s->cpu, PPC_INTERRUPT_EXT, 1);
+    timer_mod(s->timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 16666667ULL); /* ~60 Hz */
+}
 
 /* Log MMIO accesses outside well-known ranges to help trace kernel behavior */
 static void mpc5200_log_access(const char *rw, hwaddr offset, uint64_t val, unsigned size)
@@ -126,14 +147,25 @@ static void mpc5200_log_access(const char *rw, hwaddr offset, uint64_t val, unsi
 
 static uint64_t mpc5200_mmio_read(void *opaque, hwaddr offset, unsigned size)
 {
+    MPC5200State *s = opaque;
+
+    /* IC: ICTL_MAIN_TASK_PRIO_ACTIVE_PEND — identify Slice Timer 1 as active source */
+    if (offset == 0x0508 && s->ic_pending) {
+        return 0x00000001; /* SLT1 = source 1 in active field */
+    }
+    /* IC: ICTL_MAIN_PEND — bit 30 = SLT1 pending */
+    if (offset == 0x0524 && s->ic_pending) {
+        return 0x40000000;
+    }
+
     /* I2C1 SR=0x3d0c, I2C2 SR=0x3d4c: MCF+MIF set = transfer complete */
     if (offset == 0x3d0c || offset == 0x3d4c) {
         return 0x82000000;
     }
     /* I2C2 data register: return next EEPROM byte */
     if (offset == 0x3d50) {
-        uint8_t b = mpc5200_eeprom[mpc5200_i2c_byte % sizeof(mpc5200_eeprom)];
-        mpc5200_i2c_byte++;
+        uint8_t b = mpc5200_eeprom[s->i2c_byte % sizeof(mpc5200_eeprom)];
+        s->i2c_byte++;
         return (uint64_t)b << 24; /* BE: byte in MSB position */
     }
     /*
@@ -152,9 +184,17 @@ static uint64_t mpc5200_mmio_read(void *opaque, hwaddr offset, unsigned size)
 static void mpc5200_mmio_write(void *opaque, hwaddr offset,
                                uint64_t value, unsigned size)
 {
+    MPC5200State *s = opaque;
+
+    /* IC register write: ack interrupt and deassert */
+    if (offset >= 0x0500 && offset <= 0x052c) {
+        s->ic_pending = false;
+        ppc_set_irq(s->cpu, PPC_INTERRUPT_EXT, 0);
+        return;
+    }
     /* Reset EEPROM byte counter when BSP initiates a new I2C transfer */
     if (offset == 0x3d48 && (value & 0x10000000)) { /* MBCR2 START bit */
-        mpc5200_i2c_byte = 0;
+        s->i2c_byte = 0;
         return;
     }
     /* PSC TX data: PSCn at MBAR+0x2000, TX buffer at PSCn+0x0c */
@@ -243,7 +283,7 @@ static void ppc_core99_init(MachineState *machine)
     const char *bios_name = machine->firmware ?: PROM_FILENAME;
     MemoryRegion *bios = g_new(MemoryRegion, 1);
     MemoryRegion *sram = g_new(MemoryRegion, 1);
-    MemoryRegion *mpc5200 = g_new(MemoryRegion, 1);
+    MPC5200State *mpc5200 = g_new0(MPC5200State, 1);
     hwaddr kernel_base = 0, initrd_base = 0, cmdline_base = 0;
     long kernel_size = 0, initrd_size = 0;
     PCIBus *pci_bus;
@@ -574,9 +614,18 @@ static void ppc_core99_init(MachineState *machine)
     sysbus_mmio_map(s, 1, CFG_ADDR + 2);
 
     /* MPC5200 MBAR region: custom stub returning plausible I2C status values */
-    memory_region_init_io(mpc5200, NULL, &mpc5200_mmio_ops, NULL,
+    mpc5200->cpu = POWERPC_CPU(first_cpu);
+    mpc5200->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, mpc5200_tick, mpc5200);
+    /* delay first tick by 1 s of guest time to let BSP install interrupt vectors */
+    {
+        int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        fprintf(stderr, "MPC5200: init timer, now=%"PRId64"\n", now);
+        fflush(stderr);
+        timer_mod(mpc5200->timer, now + 1000000000LL);
+    }
+    memory_region_init_io(&mpc5200->mr, NULL, &mpc5200_mmio_ops, mpc5200,
                           "mpc5200-mmio", 1 * MiB);
-    memory_region_add_subregion(get_system_memory(), 0xf0000000, mpc5200);
+    memory_region_add_subregion(get_system_memory(), 0xf0000000, &mpc5200->mr);
 
     /* MPC5200 internal SRAM at 0x601f8000 (64 KiB) */
     memory_region_init_ram(sram, NULL, "mpc5200-sram", 64 * KiB, &error_fatal);
