@@ -515,16 +515,61 @@ static void mpc5200_tick(void *opaque)
                     "BestComm: BSS[0x008CFC00] (FEC TX task handle) = 0x%08x\n",
                     tx_handle);
             if (tx_handle) {
-                uint32_t slot = ldl_be_phys(&address_space_memory,
-                                            tx_handle + BCOM_TASK_HANDLE_SLOT);
-                uint32_t init = ldl_be_phys(&address_space_memory,
-                                            tx_handle + BCOM_TASK_HANDLE_INITIATOR);
-                uint32_t bdsz = ldl_be_phys(&address_space_memory,
-                                            tx_handle + BCOM_TASK_HANDLE_BD_SIZE);
+                uint32_t w[8];
+                for (int i = 0; i < 8; i++) {
+                    w[i] = ldl_be_phys(&address_space_memory,
+                                       tx_handle + i * 4);
+                }
                 fprintf(stderr,
-                        "  TX handle: slot=%u initiator=%u bd_size=%u "
-                        "(real var-table is in SRAM via TDT)\n",
-                        slot, init, bdsz);
+                        "  TX handle dump @0x%08x:\n"
+                        "    [0x00]=0x%08x [0x04]=0x%08x [0x08]=0x%08x [0x0C]=0x%08x\n"
+                        "    [0x10]=0x%08x [0x14]=0x%08x [0x18]=0x%08x [0x1C]=0x%08x\n",
+                        tx_handle,
+                        w[0], w[1], w[2], w[3],
+                        w[4], w[5], w[6], w[7]);
+                /* Deref the SRAM pointers (handle[1..5] and [7]) to see
+                 * what var-table values they actually point at. */
+                for (int i = 1; i <= 5; i++) {
+                    if (w[i] >= 0xF0008000 && w[i] < 0xF000C000) {
+                        uint32_t v = ldl_be_phys(&address_space_memory, w[i]);
+                        fprintf(stderr,
+                                "    *handle[%d](0x%08x) = 0x%08x\n",
+                                i, w[i], v);
+                    }
+                }
+                if (w[7] >= 0xF0008000 && w[7] < 0xF000C000) {
+                    uint32_t v = ldl_be_phys(&address_space_memory, w[7]);
+                    fprintf(stderr,
+                            "    *handle[7](0x%08x) = 0x%08x\n", w[7], v);
+                }
+                /* Also dump the contiguous 8-word region at SRAM
+                 * pointed by handle[1] — this is likely the actual
+                 * MOTbcommlib var-table for this task. */
+                if (w[1] >= 0xF0008000 && w[1] < 0xF000C000) {
+                    fprintf(stderr, "    SRAM[%08x..+0x20] var-table:\n      ",
+                            w[1]);
+                    for (int i = 0; i < 8; i++) {
+                        uint32_t v = ldl_be_phys(&address_space_memory,
+                                                 w[1] + i * 4);
+                        fprintf(stderr, "%08x ", v);
+                    }
+                    fprintf(stderr, "\n");
+                }
+                /* Also dump 16 words starting at *handle[5] (potential
+                 * BD ring start). */
+                if (w[5] >= 0xF0008000 && w[5] < 0xF000C000) {
+                    uint32_t bd_ring_addr = ldl_be_phys(
+                        &address_space_memory, w[5]);
+                    fprintf(stderr,
+                            "    bd_ring? *handle[5]=0x%08x; dumping 16 u32 there:\n      ",
+                            bd_ring_addr);
+                    for (int i = 0; i < 16; i++) {
+                        uint32_t v = ldl_be_phys(&address_space_memory,
+                                                 bd_ring_addr + i * 4);
+                        fprintf(stderr, "%08x ", v);
+                    }
+                    fprintf(stderr, "\n");
+                }
             }
             fflush(stderr);
             last_tx_handle = tx_handle;
@@ -534,15 +579,31 @@ static void mpc5200_tick(void *opaque)
                     "BestComm: BSS[0x008CFC04] (FEC RX task handle) = 0x%08x\n",
                     rx_handle);
             if (rx_handle) {
-                uint32_t slot = ldl_be_phys(&address_space_memory,
-                                            rx_handle + BCOM_TASK_HANDLE_SLOT);
-                uint32_t init = ldl_be_phys(&address_space_memory,
-                                            rx_handle + BCOM_TASK_HANDLE_INITIATOR);
-                uint32_t bdsz = ldl_be_phys(&address_space_memory,
-                                            rx_handle + BCOM_TASK_HANDLE_BD_SIZE);
+                uint32_t w[8];
+                for (int i = 0; i < 8; i++) {
+                    w[i] = ldl_be_phys(&address_space_memory,
+                                       rx_handle + i * 4);
+                }
                 fprintf(stderr,
-                        "  RX handle: slot=%u initiator=%u bd_size=%u\n",
-                        slot, init, bdsz);
+                        "  RX handle dump @0x%08x:\n"
+                        "    [0x00]=0x%08x [0x04]=0x%08x [0x08]=0x%08x [0x0C]=0x%08x\n"
+                        "    [0x10]=0x%08x [0x14]=0x%08x [0x18]=0x%08x [0x1C]=0x%08x\n",
+                        rx_handle,
+                        w[0], w[1], w[2], w[3],
+                        w[4], w[5], w[6], w[7]);
+                for (int i = 1; i <= 5; i++) {
+                    if (w[i] >= 0xF0008000 && w[i] < 0xF000C000) {
+                        uint32_t v = ldl_be_phys(&address_space_memory, w[i]);
+                        fprintf(stderr,
+                                "    *handle[%d](0x%08x) = 0x%08x\n",
+                                i, w[i], v);
+                    }
+                }
+                if (w[7] >= 0xF0008000 && w[7] < 0xF000C000) {
+                    uint32_t v = ldl_be_phys(&address_space_memory, w[7]);
+                    fprintf(stderr,
+                            "    *handle[7](0x%08x) = 0x%08x\n", w[7], v);
+                }
             }
             fflush(stderr);
             last_rx_handle = rx_handle;
@@ -731,28 +792,42 @@ static uint64_t mpc5200_mmio_read(void *opaque, hwaddr offset, unsigned size)
 }
 
 /*
- * BestComm TX BD-walker stub (executor for FEC slot 2).
+ * BestComm TX BD-walker (executor for FEC slot 2).
  *
- * NOTE: this walker assumes BSS@0x008CFC00 reaches the var-table
- * directly, but per BSP_var_table_findings.md (agent 2026-04-28) it
- * actually reaches a MOTbcommlib task HANDLE wrapper whose pointer
- * fields are HTAB-mapped virtual addresses, not physical. The real
- * var-table lives in BestComm SRAM via TDT. This stub is kept as a
- * placeholder; redesign needed once TCR[2] writes are observed and we
- * can snoop the SRAM TDT to find the actual var-table.
- *
- * BD format per BSP_motbcommlib_layout.md:
- *   u32 status;   // BCOM_BD_READY @ bit 30 (mask 0x40000000)
- *                 // BCOM_FEC_TX_BD_TFD @ bit 27 (last-in-frame marker)
- *                 // length in low 11 bits
- *   u32 skb_pa;   // physical address of payload buffer
+ * Vestas BSP uses the standard Linux MOTbcommlib layout — verified via
+ * SRAM-write trace 2026-04-28:
+ *   TaskBAR (MBAR+0x1200) = 0xF0008000 (start of internal SRAM)
+ *   TDT[2] @ 0xF0008040 (TaskBAR + 2*0x20)
+ *   TDT[2].var @ 0xF0008048 = 0xF0008700 (TX var-table base)
+ *   TX var-table:
+ *     +0x00 DRD ptr
+ *     +0x04 fifo  = 0xF00031A4 (FEC TFIFO_DATA)
+ *     +0x08 enable = 0xF0001220 (TCR[2])
+ *     +0x0C bd_base  (e.g. 0xF0009400)
+ *     +0x10 bd_last  (e.g. 0xF00095F8)
+ *     +0x14 bd_start
+ *     +0x18 buffer_size (1522 = MTU)
+ *   BD: u32 status; u32 skb_pa;  (8 bytes BE)
+ *     status: BCOM_BD_READY (0x40000000), BCOM_FEC_TX_BD_TFD (0x08000000),
+ *             BCOM_FEC_TX_BD_TC (0x04000000), 11-bit length in low bits.
  */
 static void mpc5200_bestcomm_walk_tx(MPC5200State *s)
 {
-    uint32_t var = ldl_be_phys(&address_space_memory, BCOM_BSS_TX_TASK_PTR);
-    if (var == 0) {
+    uint32_t taskbar = ((uint32_t)s->bestcomm[0] << 24)
+                     | ((uint32_t)s->bestcomm[1] << 16)
+                     | ((uint32_t)s->bestcomm[2] <<  8)
+                     |  (uint32_t)s->bestcomm[3];
+    if (taskbar < 0xF0008000 || taskbar >= 0xF000C000) {
         fprintf(stderr,
-                "BestComm TX: TCR[2] enabled but BSS[0x008CFC00] is NULL\n");
+                "BestComm TX: TaskBAR=0x%08x not in SRAM range\n", taskbar);
+        fflush(stderr);
+        return;
+    }
+
+    uint32_t var = ldl_be_phys(&address_space_memory, taskbar + 0x40 + 0x08);
+    if (var < 0xF0008000 || var >= 0xF000C000) {
+        fprintf(stderr,
+                "BestComm TX: TDT[2].var=0x%08x out of SRAM\n", var);
         fflush(stderr);
         return;
     }
@@ -765,9 +840,9 @@ static void mpc5200_bestcomm_walk_tx(MPC5200State *s)
                                     var + BCOM_FEC_TX_VAR_BD_START);
 
     fprintf(stderr,
-            "BestComm TX: walk var=0x%08x bd_base=0x%08x bd_last=0x%08x "
-            "bd_start=0x%08x\n",
-            var, bd_base, bd_last, bd_start);
+            "BestComm TX: TaskBAR=0x%08x var=0x%08x bd_base=0x%08x "
+            "bd_last=0x%08x bd_start=0x%08x\n",
+            taskbar, var, bd_base, bd_last, bd_start);
     fflush(stderr);
 
     if (!bd_base || !bd_last || bd_start < bd_base || bd_start > bd_last) {
@@ -891,6 +966,16 @@ static void mpc5200_mmio_write(void *opaque, hwaddr offset,
                 fflush(stderr);
             }
         }
+        if (offset == 0x1200 && size == 4) {
+            /* TaskBAR write — points at TDT in SRAM. Hardware default
+             * 0xFC003000 (chip-internal-SRAM offset); BSP may rewrite
+             * to point inside MBAR+0x8000 SRAM after init. */
+            fprintf(stderr,
+                    "*** BestComm TaskBAR WRITE: 0x%08x  NIP=0x%08x LR=0x%08x ***\n",
+                    (unsigned)value, (unsigned)s->cpu->env.nip,
+                    (unsigned)s->cpu->env.lr);
+            fflush(stderr);
+        }
         if (offset >= 0x121C && offset < 0x123C && size <= 2) {
             unsigned slot = (offset - 0x121C) / 2;
             uint16_t tcr = (uint16_t)(value & 0xFFFF);
@@ -919,6 +1004,22 @@ static void mpc5200_mmio_write(void *opaque, hwaddr offset,
         for (int k = (int)size - 1; k >= 0 && (i + k) < (int)sizeof(s->sram); k--) {
             s->sram[i + k] = v & 0xff;
             v >>= 8;
+        }
+        /* Diagnostic: skip the early bzero pass (NIP 0x002053b8 area
+         * doing reverse bzero of all SRAM) so we see the actually-
+         * interesting TDT/var-table writes that come after. */
+        {
+            static unsigned sram_log = 0;
+            target_ulong nip = s->cpu->env.nip;
+            bool is_bzero = (nip >= 0x002053b0 && nip <= 0x002053c4);
+            if (!is_bzero && sram_log++ < 600) {
+                target_ulong lr = s->cpu->env.lr;
+                fprintf(stderr,
+                        "SRAM W +0x%03x sz=%u val=0x%08x  NIP=0x%08x LR=0x%08x\n",
+                        (unsigned)(offset - 0x8000), size, (unsigned)value,
+                        (unsigned)nip, (unsigned)lr);
+                fflush(stderr);
+            }
         }
         return;
     }
