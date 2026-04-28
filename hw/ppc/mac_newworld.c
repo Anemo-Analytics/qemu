@@ -302,20 +302,18 @@ static void mpc5200_tick(void *opaque)
     }
 
     /*
-     * Diagnostic: every 60 ticks (~1 s), sample NIP and LR. Log if the
-     * CPU is currently executing in the FEC driver region
-     * (0x12c000..0x130000) — that tells us whether m5200FecEndLoad ever
-     * runs and where it diverges.
+     * Diagnostic: sample NIP every tick for the first few seconds.
+     * Log when NIP is NOT in the idle loop (intUnlock @ 0x0100107c
+     * for bootrom, or 0x207fxx for vxworks.out runtime). This
+     * captures any code path the boot task touches.
      */
-    if ((tick_count % 60) == 0) {
+    {
         target_ulong nip = s->cpu->env.nip;
         target_ulong lr  = s->cpu->env.lr;
-        if (nip >= 0x12c000 && nip < 0x130000) {
-            fprintf(stderr, "TRACE: NIP=0x%08x LR=0x%08x (in FEC driver)\n",
-                    (unsigned)nip, (unsigned)lr);
-            fflush(stderr);
-        } else if ((tick_count / 60) <= 30) {
-            /* Log NIP for first 30 sample windows to see general activity */
+        bool in_idle =
+            (nip >= 0x00207f00 && nip < 0x00208000) ||  /* runtime idle */
+            (nip >= 0x01001000 && nip < 0x01001200);    /* bootrom idle */
+        if (!in_idle && tick_count < 600) {
             fprintf(stderr, "TRACE: NIP=0x%08x LR=0x%08x\n",
                     (unsigned)nip, (unsigned)lr);
             fflush(stderr);
@@ -403,9 +401,25 @@ static uint64_t mpc5200_mmio_read(void *opaque, hwaddr offset, unsigned size)
         }
         return v << (8 * (4 - size));
     }
-    /* I2C1 SR=0x3d0c: legacy stub (no chip behind it) — keep MCF+MIF set */
-    if (offset == 0x3d0c) {
-        return 0x82000000;
+    /*
+     * I2C1 (MBAR+0x3D00..0x3D14): no real chip behind it. Provide
+     * NACK semantics so any probe sees "no slave" and moves on.
+     */
+    if (offset >= 0x3d00 && offset < 0x3d20) {
+        static unsigned i2c1_r_log = 0;
+        if (i2c1_r_log++ < 64) {
+            fprintf(stderr, "I2C1 R +0x%02x sz=%u  NIP=0x%08x\n",
+                    (unsigned)(offset - 0x3d00), size,
+                    (unsigned)s->cpu->env.nip);
+            fflush(stderr);
+        }
+        if (offset == 0x3d0c) {
+            return 0x83000000;     /* MCF+MIF+RXAK = transfer done, no ack */
+        }
+        if (offset == 0x3d10) {
+            return 0xff000000;     /* open bus */
+        }
+        return 0;
     }
     /* I2C2 (0x3d40..0x3d57): X1226 state machine + register read-back */
     if (offset == 0x3d40) { return (uint64_t)s->i2c2.madr   << 24; }
