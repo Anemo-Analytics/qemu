@@ -117,6 +117,42 @@ the toolkit to be satisfied.
 
 ---
 
+## Strategic decisions log
+
+Append-only. New entries at the top. One line per decision.
+
+- **2026-04-28** — Chose path A1 (FTP recovery boot) over A2 (pre-loaded
+  runtime) and A3 (tffs cold-start). Reason: richest test surface;
+  BestComm executor needed for gate 9 anyway so not wasted; cost ~2
+  extra weeks vs A2. See
+  `docs/superpowers/specs/2026-04-28-strategy-and-doc-rhythm-design.md`.
+- **2026-04-28** — Adopted documentation rhythm: living PLAN.md +
+  per-gate commit discipline + this decisions log + per-person plans
+  retire when their work is done. Strategy spec captures full reasoning.
+- **2026-04-28** — Daniele's diagnosis track complete; findings landed
+  in `BSP_park_findings.md`. `PLAN_Daniele.md` retired (kept in repo
+  for history; no longer load-bearing).
+
+---
+
+## Doc map (when you come back cold)
+
+What to read in order, after a week away:
+
+1. **`PLAN.md`** (this file) — current gate position + decisions log
+2. **Most recent findings doc** — raw evidence for current state
+   - Latest: `BSP_fec_bestcomm_findings.md` (gate-3 wiring intel)
+3. **Whichever per-person plan is active** — current work checklist
+   - Active: `PLAN_Kasper.md` (steps 1,2,4,5,6 done; step 3 in progress)
+   - Retired: `PLAN_Daniele.md` (his work is done)
+   - Placeholder: `PLAN_Phase2.5_filesystem.md` (promote when reaching gate 7)
+
+PLAN.md is the living spec — if a section here contradicts older docs,
+PLAN.md wins. Findings docs are *frozen evidence* (citations), not
+maintained.
+
+---
+
 ## Where we are (2026-04-28)
 
 Kernel loads, executes, scheduler runs, all peripheral stubs init clean.
