@@ -162,10 +162,18 @@ when FEC IRQ asserts, set `ic_pending` and `ppc_set_irq(EXT, 1)`.
 
 ### 6. Host-side FTP
 
+**Confirmed boot-mode parameters from Daniele's diagnosis (BSP_park_findings.md):**
+
+- Server IP:    `169.254.254.252` (target boots at `.254`)
+- Protocol:     anonymous FTP (RFC 959, no special handshake)
+- Username:     `anonymous`
+- Password:     `test@cotas.dk`
+- File:         `ct6003/vxworks` (relative to FTP serve root)
+
 QEMU command line:
 
 ```bash
--netdev user,id=n0,net=169.254.254.0/24,host=169.254.254.253,\
+-netdev user,id=n0,net=169.254.254.0/24,host=169.254.254.252,\
 hostfwd=tcp::21-:21 \
 -device mpc5200-fec,netdev=n0,mac=00:1b:f0:00:00:0a
 ```
@@ -173,18 +181,38 @@ hostfwd=tcp::21-:21 \
 SLIRP doesn't ship an FTP server. Two options:
 
 **Option A — host-side `vsftpd` (try first):**
-- Bind vsftpd to 169.254.254.253:21
-- Serve `/path/to/turbine_dump/bin/release_diab_ppc/` as serve root
+- Bind vsftpd to 169.254.254.252:21
+- Anonymous-only, allow anonymous-without-real-mail-format password
+- Serve a directory tree containing `ct6003/vxworks` (the runmode binary)
 - SLIRP forwards control + data channels via `hostfwd`
 - Risk: passive-mode FTP data channel may need extra forwards
 
 **Option B — `-netdev tap` (fallback):**
-- Configure a host TAP interface with 169.254.254.253/24
+- Configure a host TAP interface with 169.254.254.252/24
 - Run vsftpd bound to the TAP
 - More setup, no SLIRP weirdness
 
 Try A first. If it doesn't pass FTP control+data correctly, switch to
 B.
+
+### 6-alt. Cold-start via tffs (sidesteps FTP entirely)
+
+Daniele's diagnosis surfaced an alternative the original plan missed:
+the BSP supports **`tffs=0,0(0,0)`** as a bootline parameter, which
+causes VxWorks to load the runtime image from NAND flash (TrueFFS)
+instead of doing the FTP boot dance.
+
+If we model a NAND flash device with the runmode binary at the right
+flash offset, we can skip the FEC + FTP dependency for *boot*
+entirely (FEC still needed afterwards for normal turbine networking).
+
+Tradeoff:
+- Pro: avoids vsftpd setup, slirp FTP weirdness, and packet flow
+  validation as a precondition for getting a serial banner
+- Con: requires modeling MPC5200 NAND flash controller (LocalPlus
+  bus + TrueFFS-formatted image), which is its own QEMU device-model
+  effort
+- Decision deferred until FEC track shows real difficulty
 
 ### 7. Verify
 
@@ -193,7 +221,7 @@ ninja -C build qemu-system-ppc
 
 timeout 30 ./build/qemu-system-ppc -machine mac99 -cpu mpc5200 -m 256 \
   -device loader,file=/tmp/vxworks_romfs/vxworks.out,cpu-num=0 \
-  -netdev user,id=n0,net=169.254.254.0/24,host=169.254.254.253 \
+  -netdev user,id=n0,net=169.254.254.0/24,host=169.254.254.252 \
   -device mpc5200-fec,netdev=n0,mac=00:1b:f0:00:00:0a \
   -display none -serial stdio 2>&1 | head -80
 ```

@@ -6,26 +6,108 @@ multi-node ARCnet later.
 
 ---
 
+## Honest status — how far to the target
+
+End goal: **VOT connects to QEMU and treats it as a live CT6003**.
+Estimate of progress: **~20–25% of the way there.**
+
+### Phase-by-phase breakdown
+
+| Phase | What it means | Status | Effort remaining |
+|---|---|---|---|
+| 0. Toolchain + load image | QEMU builds, vxworks.out loads, CPU executes | ✅ DONE | 0 |
+| 1. Stable scheduler | Kernel runs, no exception loops, peripheral stubs init clean | ✅ DONE | 0 |
+| 2a. FEC device model (CSR/MII) | Register layout, MII access, link state, IRQ wiring | ⏳ NOT STARTED | ~3 days |
+| 2b. BestComm task executor | Interpret SDMA TCR writes, parse descriptors in SRAM, copy bytes, fire IRQ | ⏳ NOT STARTED — REQUIRED per manual page 14-1 | ~3–7 days (highest uncertainty) |
+| 2c. Host-side FTP plumbing | vsftpd or pyftpdlib serving `ct6003/vxworks` at 169.254.254.252 | ⏳ NOT STARTED | ~½ day |
+| 2d. First serial banner | Kernel completes FTP boot, prints banner | ⏳ Gates on 2a+2b+2c | ½–1 day debug |
+| 2.5. Filesystem mount | Node 10 dump readable from VxWorks | 🟡 SCOPE UNCLEAR | ~2–3 days if needed |
+| 3a. App layer: Firecrest | Stub enough of the protocol that VOT reaches it | 🔴 NOT INVESTIGATED | weeks |
+| 3b. App layer: AP | Vestas Application Protocol (parameter read/write) | 🔴 NOT INVESTIGATED | weeks |
+| 3c. App layer: Firedrake | File transfer protocol on port 9482 | 🔴 NOT INVESTIGATED | days |
+| 3d. App layer: NEON | Subscription / live data | 🔴 NOT INVESTIGATED | weeks |
+| 4. VOT actually connects | VOT recognises the QEMU instance as a turbine | 🔴 GATES ON ALL OF 3 | unknown |
+| 5. Multi-node ARCnet | Simulate the rest of the controller stack | 🔴 OUT OF SCOPE for PoC | not estimated |
+
+### What's CONFIRMED vs HYPOTHETICAL
+
+**Confirmed (evidence in repo):**
+- Kernel boots and reaches the windExit idle loop (Daniele's diagnosis)
+- App tasks block on FTP boot completion (Daniele's diagnosis)
+- FEC requires BestComm DMA — not optional (manual page 14-1 quote)
+- Boot server: `169.254.254.252`, anonymous FTP, file `ct6003/vxworks`
+- Cold-start alternative `tffs=0,0(0,0)` exists but requires NAND model
+
+**Hypothetical (not yet validated):**
+- That a working FEC + BestComm + FTP gets us a serial banner. (Plausible
+  — Daniele showed all app tasks block on this — but we haven't *seen*
+  it work end-to-end yet.)
+- That VOT will accept the QEMU instance once Phase 3 protocols are
+  stubbed enough. We don't know how strict VOT's identity/protocol
+  checks are.
+- That a single-node Ground configuration is enough — VOT might
+  require ARCnet multi-node for any meaningful interaction.
+- That Phase 3 protocols can be stubbed at all without writing real
+  state machines that match real turbine behavior.
+
+### Biggest unknowns (in rough order of risk)
+
+1. **BestComm executor complexity.** We know it's required, but we
+   don't yet know how the BSP wires up FEC tasks (which task slots,
+   what descriptor layout). Could be 2 days or 7. Track A overlap may
+   surface this faster.
+2. **Phase 3 effort.** Stubbing four Vestas-proprietary
+   application-layer protocols. We have decompiled VOT-side code (per
+   CLAUDE.md vault references) so it's not blind, but it's a lot of
+   code to mirror.
+3. **VOT acceptance criteria.** What makes VOT decide "yes this is a
+   real turbine"? Identity? Specific signal subscriptions returning
+   plausible values? We don't know yet.
+4. **Multi-node necessity.** If VOT needs Ground + Top + Hub at
+   minimum, single-node PoC is fundamentally insufficient and we add
+   ARCnet emulation as a hard dependency.
+
+### What this means in practice
+
+- **Phase 2 (Kasper now):** ~1 week of focused work, finite scope,
+  high confidence we'll see a serial banner if the FEC + BestComm +
+  FTP triangle works.
+- **Phase 3 (after Phase 2):** weeks-to-months of less-bounded work
+  reverse-engineering and stubbing application protocols. This is the
+  real long pole.
+- **The "VOT actually treats it as a turbine" milestone** is months
+  of work from where we are now, not days.
+
+If the scope feels too long: the cold-start `tffs` path could let us
+**skip Phase 2 entirely** and jump to Phase 2.5 + Phase 3 with a real
+filesystem from Røye2. Tradeoff is modeling NAND flash instead of FEC
++ BestComm — different complexity, same end result.
+
+---
+
 ## Where we are (2026-04-28)
 
 Kernel loads, executes, scheduler runs, all peripheral stubs init clean.
 EXT/DECR exception flow stable — only `EXTERNAL` and `DECR` in the
 `-d int` log, no `HV_EMU` or `PROGRAM`.
 
-**Parked at NIP `0x207fe8`** waiting for an event we don't deliver.
-Hypothesis: `vxworks.out` is in **boot mode at link-local
-169.254.254.254** waiting for a technician laptop at 169.254.254.253 to
-FTP application binaries onto flash. Strong but unverified.
+**Confirmed by Daniele's diagnosis (`BSP_park_findings.md`):** kernel
+idles in `windExit`'s reschedule loop polling `kernelState` at RAM
+`0x908310`. All application tasks are blocked waiting for anonymous
+FTP boot to complete from **`169.254.254.252`** (target boots at
+`.254`). Credentials: `anonymous` / `test@cotas.dk`. File:
+`ct6003/vxworks`. The previously-suspected "park" at `0x207fe8` was
+the saved-NIP from the windExit fast-exit `isync` — a red herring.
 
 Working stubs in `hw/ppc/mac_newworld.c`:
 - IC: SLT1 active-source + PerEnc read-to-clear at 0x524
 - I2C2 X1226 + AT24Cxx state machine, slaves 0x50/0x57/0x6f
-- BestComm/SDMA register file + 32 KiB internal SRAM
+- BestComm/SDMA register file + 16 KiB internal SRAM (per manual §13.13)
 - PSC TX-ready stub (no real chars yet)
 - EXT delivery gated on populated handler at 0x500
 
-What's missing to unblock the park: depends on the verdict from
-Daniele's diagnosis (see `PLAN_Daniele.md`).
+What's missing to unblock boot: a real FEC + BestComm DMA executor +
+host-side anonymous FTP serving `ct6003/vxworks`. See `PLAN_Kasper.md`.
 
 ---
 

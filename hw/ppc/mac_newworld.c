@@ -157,10 +157,12 @@ typedef struct {
      */
     uint8_t          bestcomm[0x100];
     /*
-     * MPC5200 internal SRAM (MBAR+0x8000..0xFFFF, 32 KiB). BestComm stores
-     * task descriptors here. The BSP reads/writes it as memory.
+     * MPC5200 internal SRAM (MBAR+0x8000..0xBFFF, 16 KiB per manual §13.13).
+     * BestComm stores task descriptors here. The BSP reads/writes it as
+     * memory. Addresses 0xC000..0xFFFF are reserved on real hardware —
+     * we leave them to the fall-through unimplemented stub.
      */
-    uint8_t          sram[0x8000];
+    uint8_t          sram[0x4000];
 } MPC5200State;
 
 static void mpc5200_i2c2_init(MPC5200I2CState *i2c)
@@ -253,8 +255,8 @@ static uint64_t mpc5200_mmio_read(void *opaque, hwaddr offset, unsigned size)
         }
         return v << (8 * (4 - size)); /* MSB-align the result for BE */
     }
-    /* MPC5200 internal SRAM (MBAR+0x8000..0xFFFF, 32 KiB) */
-    if (offset >= 0x8000 && offset < 0x10000) {
+    /* MPC5200 internal SRAM (MBAR+0x8000..0xBFFF, 16 KiB per manual §13.13) */
+    if (offset >= 0x8000 && offset < 0xC000) {
         unsigned i = offset - 0x8000;
         uint64_t v = 0;
         for (unsigned k = 0; k < size && (i + k) < sizeof(s->sram); k++) {
@@ -336,8 +338,8 @@ static void mpc5200_mmio_write(void *opaque, hwaddr offset,
         }
         return;
     }
-    /* MPC5200 internal SRAM (MBAR+0x8000..0xFFFF, 32 KiB) */
-    if (offset >= 0x8000 && offset < 0x10000) {
+    /* MPC5200 internal SRAM (MBAR+0x8000..0xBFFF, 16 KiB per manual §13.13) */
+    if (offset >= 0x8000 && offset < 0xC000) {
         unsigned i = offset - 0x8000;
         uint64_t v = value;
         if (size < 4) {
