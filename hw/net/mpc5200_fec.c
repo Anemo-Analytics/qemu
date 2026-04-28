@@ -387,17 +387,23 @@ static bool mpc5200_fec_can_receive(NetClientState *nc)
     return (s->regs[FEC_ECR / 4] & ECR_ETHER_EN) != 0;
 }
 
+/* Hook installed by the BestComm executor stub in mac_newworld.c. */
+static void (*mpc5200_fec_rx_hook)(const uint8_t *buf, size_t len);
+
+void mpc5200_fec_set_rx_hook(void (*hook)(const uint8_t *, size_t));
+void mpc5200_fec_set_rx_hook(void (*hook)(const uint8_t *, size_t))
+{
+    mpc5200_fec_rx_hook = hook;
+}
+
 static ssize_t mpc5200_fec_receive(NetClientState *nc, const uint8_t *buf,
                                    size_t len)
 {
     MPC5200FECState *s = qemu_get_nic_opaque(nc);
-    /*
-     * No BestComm Rx task model yet — drop frame on the floor.
-     * Once the executor is in, this becomes a producer to a small
-     * Rx FIFO that the executor drains.
-     */
     (void)s;
-    (void)buf;
+    if (mpc5200_fec_rx_hook) {
+        mpc5200_fec_rx_hook(buf, len);
+    }
     return len;
 }
 

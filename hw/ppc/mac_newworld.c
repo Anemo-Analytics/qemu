@@ -983,6 +983,93 @@ static void mpc5200_bestcomm_walk_tx(MPC5200State *s)
     fflush(stderr);
 }
 
+/* Pointer to the live MPC5200State for the static RX hook. */
+static MPC5200State *g_mpc5200_for_rx;
+
+/*
+ * BestComm RX hook (executor for FEC slot 3).
+ *
+ * Called from the FEC's .receive callback when the host network stack
+ * delivers an inbound Ethernet frame. We walk the RX BD ring (in SRAM
+ * via TDT[3].var), find a BD with READY=1, copy the frame to its
+ * skb_pa in DRAM, mark BCOM_FEC_RX_BD_L + length, clear READY, advance
+ * cursor, fire EIR.RXF.
+ *
+ * RX var-table layout (Linux MOTbcommlib bcom_fec_rx_var):
+ *   +0x00 enable, +0x04 fifo, +0x08 bd_base, +0x0C bd_last,
+ *   +0x10 bd_start, +0x14 buffer_size
+ */
+static void mpc5200_bestcomm_rx_hook(const uint8_t *buf, size_t len)
+{
+    MPC5200State *s = g_mpc5200_for_rx;
+    if (!s || len < 14 || len > 2048) {
+        return;
+    }
+
+    uint32_t taskbar = ((uint32_t)s->bestcomm[0] << 24)
+                     | ((uint32_t)s->bestcomm[1] << 16)
+                     | ((uint32_t)s->bestcomm[2] <<  8)
+                     |  (uint32_t)s->bestcomm[3];
+    if (taskbar < 0xF0008000 || taskbar >= 0xF000C000) {
+        return; /* TaskBAR not set yet — drop */
+    }
+
+    /* TDT[3].var = taskbar + 3*0x20 + 0x08 */
+    uint32_t var = ldl_be_phys(&address_space_memory, taskbar + 0x60 + 0x08);
+    if (var < 0xF0008000 || var >= 0xF000C000) {
+        return;
+    }
+
+    uint32_t bd_base  = ldl_be_phys(&address_space_memory,
+                                    var + BCOM_FEC_RX_VAR_BD_BASE);
+    uint32_t bd_last  = ldl_be_phys(&address_space_memory,
+                                    var + BCOM_FEC_RX_VAR_BD_LAST);
+    uint32_t bd_start = ldl_be_phys(&address_space_memory,
+                                    var + BCOM_FEC_RX_VAR_BD_START);
+
+    if (!bd_base || !bd_last || bd_start < bd_base || bd_start > bd_last) {
+        return;
+    }
+
+    /* Look for the next READY BD starting at bd_start. */
+    uint32_t bd_addr = bd_start;
+    uint32_t status  = ldl_be_phys(&address_space_memory, bd_addr);
+    uint32_t skb_pa  = ldl_be_phys(&address_space_memory, bd_addr + 4);
+
+    if (!(status & BCOM_BD_READY)) {
+        fprintf(stderr,
+                "BestComm RX: BD[start=0x%08x] not READY, dropping %zu B\n",
+                bd_addr, len);
+        fflush(stderr);
+        return;
+    }
+
+    fprintf(stderr,
+            "BestComm RX: TaskBAR=0x%08x var=0x%08x bd=0x%08x skb_pa=0x%08x len=%zu\n",
+            taskbar, var, bd_addr, skb_pa, len);
+    fflush(stderr);
+
+    /* Copy the frame into the BD's skb_pa buffer in DRAM. */
+    cpu_physical_memory_write(skb_pa, buf, len);
+
+    /* Status: length in low 11 bits + BCOM_FEC_RX_BD_L (last in frame). */
+    uint32_t new_status = (uint32_t)(len & 0x7FF) | BCOM_FEC_RX_BD_L;
+    stl_be_phys(&address_space_memory, bd_addr, new_status);
+
+    /* Advance bd_start cursor in var-table. */
+    uint32_t next = (bd_addr == bd_last) ? bd_base
+                                         : bd_addr + BCOM_FEC_BD_STRIDE;
+    stl_be_phys(&address_space_memory,
+                var + BCOM_FEC_RX_VAR_BD_START, next);
+
+    if (s->fec) {
+        mpc5200_fec_raise_eir(s->fec, MPC5200_FEC_EIR_RXF);
+    }
+}
+
+/* Forward decl for the FEC -> BestComm RX hook installer. */
+void mpc5200_fec_set_rx_hook(void (*hook)(const uint8_t *, size_t));
+
 static void mpc5200_mmio_write(void *opaque, hwaddr offset,
                                uint64_t value, unsigned size)
 {
@@ -1681,6 +1768,10 @@ static void ppc_core99_init(MachineState *machine)
                            qemu_allocate_irq(mpc5200_fec_irq_handler,
                                              mpc5200, 0));
         mpc5200->fec = fec;
+        /* Install RX hook so incoming Ethernet frames are delivered to
+         * our BestComm RX walker. */
+        g_mpc5200_for_rx = mpc5200;
+        mpc5200_fec_set_rx_hook(mpc5200_bestcomm_rx_hook);
     }
 
     /* MPC5200 internal SRAM at 0x601f8000 (64 KiB) */
