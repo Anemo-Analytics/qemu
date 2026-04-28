@@ -1,182 +1,104 @@
-# Plan: Boot VxWorks MPC5200B Kernel in QEMU
+# Plan: Boot VxWorks MPC5200B in QEMU
 
-**Goal**: Produce working serial output (VxWorks shell/banner) from
-`/tmp/vxworks_romfs/vxworks.out` running under `qemu-system-ppc mac99 -cpu mpc5200`.
-
----
-
-## Current State
-
-| Item | Status |
-|------|--------|
-| Kernel loads & executes | ✅ (`-device loader` at 0x00100000) |
-| BAT / SPR init | ✅ (mpc5200 CPU model accepts all SPRs) |
-| MPC5200 MMIO stub at 0xf0000000 | ✅ (1 MB, `create_unimplemented_device`-like) |
-| I2C2 EEPROM stub (board type 23) | ✅ (version-4, CRC32=0xb8e1de02) |
-| PSC UART TX ready bits | ✅ (returns 0x30303030 for 0x2000–0x2bff) |
-| DECR interrupts | ✅ (firing, but too fast — harmless) |
-| MPC5200State struct + QEMUTimer + IC stub | ✅ (implemented, builds clean) |
-| Slice Timer EXT interrupt fires | ✅ (fires at ~60 Hz after 1 s delay) |
-| VxWorks EXT handler installed | ✅ (confirmed at 0x500 after 2 s) |
-| VxWorks handles EXT without faulting | ❌ **HV_EMU → program check loop** |
-| Serial output | ❌ (scheduler still dead) |
+**End goal:** VOT (Vestas Online Toolkit) connects to QEMU and treats it as
+a live CT6003 turbine controller. Single-node Ground (Node 10) PoC first;
+multi-node ARCnet later.
 
 ---
 
-## What Was Done This Session
+## Where we are (2026-04-28)
 
-### Implemented in `hw/ppc/mac_newworld.c`
+Kernel loads, executes, scheduler runs, all peripheral stubs init clean.
+EXT/DECR exception flow stable — only `EXTERNAL` and `DECR` in the
+`-d int` log, no `HV_EMU` or `PROGRAM`.
 
-1. Added `#include "qemu/timer.h"`
-2. Replaced `static unsigned int mpc5200_i2c_byte` with heap-allocated `MPC5200State` struct:
-   - `MemoryRegion mr`, `QEMUTimer *timer`, `PowerPCCPU *cpu`, `bool ic_pending`, `unsigned int i2c_byte`
-3. Added `mpc5200_tick()` callback: sets `ic_pending = true`, calls `ppc_set_irq(cpu, PPC_INTERRUPT_EXT, 1)`, reschedules at 60 Hz
-4. Updated `mpc5200_mmio_read()` to use `MPC5200State *s` as opaque; added IC responses:
-   - offset `0x0508` when `ic_pending`: returns `0x00000001` (SLT1 source in active field)
-   - offset `0x0524` when `ic_pending`: returns `0x40000000` (bit 30 = SLT1 pending)
-5. Updated `mpc5200_mmio_write()`: IC writes (0x0500–0x052c) clear `ic_pending` and deassert EXT
-6. Wired up in `ppc_core99_init()`: `mpc5200->cpu = POWERPC_CPU(first_cpu)`, timer scheduled 1 s after init, `memory_region_init_io(&mpc5200->mr, ...)` with `mpc5200` as opaque
+**Parked at NIP `0x207fe8`** waiting for an event we don't deliver.
+Hypothesis: `vxworks.out` is in **boot mode at link-local
+169.254.254.254** waiting for a technician laptop at 169.254.254.253 to
+FTP application binaries onto flash. Strong but unverified.
 
-**Timer confirmed firing** (debug prints visible in stderr when capturing correctly).
+Working stubs in `hw/ppc/mac_newworld.c`:
+- IC: SLT1 active-source + PerEnc read-to-clear at 0x524
+- I2C2 X1226 + AT24Cxx state machine, slaves 0x50/0x57/0x6f
+- BestComm/SDMA register file + 32 KiB internal SRAM
+- PSC TX-ready stub (no real chars yet)
+- EXT delivery gated on populated handler at 0x500
 
----
-
-## Current Blocker: HV_EMU at EXT Vector Entry
-
-**Symptom**: EXTERNAL (4) exception fires at 0x207fe8 → jumps to EXT vector 0x500 → instruction at 0x508 causes `HV_EMU (96)` → converted to program check (0x700) → infinite loop.
-
-**RAM at 0x500 (bytes in memory order)**:
-```
-0x500: 0x0c 0x0c 0xf8 0x49  → word 0x0c0cf849  (opcode 3 = twi, TO=0 = never-trap NOP)
-0x504: 0x81 0x98 0x00 0x9b  → word 0x8198009b  (opcode 32 = lwz)
-0x508: 0x13 0xe0 0x0c 0x08  → word 0x13e00c08  ← HV_EMU fires here
-```
-
-**Root cause of HV_EMU**: `0x13e00c08` has primary opcode 4 (bits 31–26 = `000100`). On G2/MPC5200, opcode 4 is unimplemented (reserved/AltiVec territory) → QEMU raises `gen_inval_exception` → `POWERPC_EXCP_HV_EMU` → converted to program check (0x700). But 0x700 also loops.
-
-**Why opcode 4?** This is suspicious — VxWorks MPC5200B BSP should not emit AltiVec instructions. Possible explanations:
-1. The bytes at 0x508 are NOT an instruction — VxWorks's EXT dispatch uses an inline table or jump-vector at the start of the 0x500 area, and the first `lwz` at 0x504 loads an address, after which execution branches elsewhere — but something goes wrong before the branch.
-2. The G2 CPU model in QEMU mis-decodes a valid G2 instruction as opcode-4 because it lacks a G2-specific instruction (e.g., `mtspr` of a G2-only SPR, or some Book E extension that the mpc5200 CPU model doesn't fully support).
-3. The `lwz` at 0x504 loads a bad address and causes an ISI before 0x508 — but the exception log shows HV_EMU at 0x508, not an ISI at 0x504.
+What's missing to unblock the park: depends on the verdict from
+Daniele's diagnosis (see `PLAN_Daniele.md`).
 
 ---
 
-## Step 2 — Fix the EXT Handler Fault  ← **DO THIS NEXT**
+## Two parallel tracks
 
-### 2a. Enable MMIO logging and trace the IC dispatch
+Work is split so Kasper + Daniele can advance in parallel without
+stepping on each other. Same repo, same Claude Code setup, different
+files.
 
-Remove the `&& 0` from the MMIO log guard in `mpc5200_log_access()` to see all IC reads/writes:
+### Daniele — diagnosis
 
-```c
-if (log_count < 2000) {   /* was: && 0 */
-```
+**Goal:** falsify or confirm the FTP-wait hypothesis. Answer "what is
+the BSP actually waiting for at `0x207fe8`?" with evidence.
 
-Run with `-d int` and capture both stderr (MMIO log) and the interrupt log:
+**Spec:** [`PLAN_Daniele.md`](PLAN_Daniele.md)
+
+**Deliverable:** one markdown report (`BSP_park_findings.md`) with a
+verdict at the top (CONFIRMED / REFUTED + the real wait condition).
+
+**Touches:** docs only, no code. Branch: `mpc5200-diagnosis` off
+current `mpc5200-stub`.
+
+### Kasper — FEC implementation
+
+**Goal:** working `mpc5200-fec` QEMU device + host-side FTP plumbing.
+First serial banner from the kernel = pass.
+
+**Spec:** [`PLAN_Kasper.md`](PLAN_Kasper.md)
+
+**Deliverable:** new `hw/net/mpc5200_fec.c`, integrated, observable
+packet flow. Pass = kernel emits PSC TX bytes; fail = still parked,
+pivot using Daniele's findings.
+
+**Touches:** `hw/net/*`, `hw/ppc/mac_newworld.c`. Branch: continue on
+`mpc5200-stub`.
+
+### How they integrate
+
+| Daniele's verdict | Effect on Kasper's track |
+|---|---|
+| FTP wait confirmed | Charge ahead, already on the right path |
+| BestComm DMA wait | Pivot to BestComm task executor before FEC |
+| RTC time-of-day wait | Fix X1226 RTC counter readback first |
+| GPT timer wait | Model GPT block, return to FEC after |
+| Proprietary boot protocol | Keep FEC device, replace vsftpd with custom shim |
+
+If Daniele finishes first and contradicts the hypothesis, Kasper saves
+days of wasted FEC work. If confirmed, Kasper's track was correct
+anyway.
+
+---
+
+## Build & run (canonical)
 
 ```bash
-timeout 5 ./qemu-system-ppc -machine mac99 -cpu mpc5200 -m 256 \
+cd /home/kasper/qemu
+ninja -C build qemu-system-ppc
+
+timeout 5 ./build/qemu-system-ppc -machine mac99 -cpu mpc5200 -m 256 \
   -device loader,file=/tmp/vxworks_romfs/vxworks.out,cpu-num=0 \
-  -display none -serial null -d int 2>/tmp/qemu_err.txt
-grep -E "MPC5200|EXTERNAL|HV_EMU|0x05" /tmp/qemu_err.txt | head -40
+  -display none -serial null -d int 2>/tmp/qemu_int.txt
+grep -oE "=> [A-Z_]+" /tmp/qemu_int.txt | sort | uniq -c
+# expect only DECR and EXTERNAL — current clean baseline
 ```
 
-This will show which IC offsets VxWorks reads during the EXT dispatch before the fault.
-
-### 2b. Decode the instruction at 0x508
-
-Use Python + capstone to disassemble the bytes `13 e0 0c 08`:
-
-```python
-import capstone
-cs = capstone.Cs(capstone.CS_ARCH_PPC, capstone.CS_MODE_BIG_ENDIAN | capstone.CS_MODE_32)
-for i in cs.disasm(bytes.fromhex('0c0cf8498198009b13e00c08b8000264'), 0x500):
-    print(f"0x{i.address:x}: {i.mnemonic} {i.op_str}")
-```
-
-If capstone decodes it as `mfspr` or `mfmsr`, the G2 CPU model may lack that SPR → QEMU raises HV_EMU. Fix: add the SPR to QEMU's G2 definition in `target/ppc/cpu_init.c`.
-
-### 2c. Check G2 SPR coverage for the failing instruction
-
-If the instruction is an `mfspr`/`mtspr` of an unknown SPR, find the SPR number and add it to the G2 register set. Common G2 SPRs not always included in QEMU:
-
-- SPR 526/527 (IBAT4U/L, IBAT5U/L, etc. — extended BATs)
-- SPR 947 (IABR2, G2 instruction address breakpoint)
-- SPR 1009 (HID1, hardware implementation dependent)
-
-### 2d. Alternative: check if the EXT vector area is being mis-fetched
-
-Verify VxWorks actually installed the handler (not zeros) by checking 0x500 at t=2s:
-
-```bash
-timeout 3 bash -c '(sleep 2 && echo "xp /32b 0x500") | \
-  ./qemu-system-ppc -machine mac99 -cpu mpc5200 -m 256 \
-  -device loader,file=/tmp/vxworks_romfs/vxworks.out,cpu-num=0 \
-  -display none -serial null -monitor stdio 2>/dev/null'
-```
+`vxworks.out` lives at `/tmp/vxworks_romfs/vxworks.out` (same path on
+both machines per shared dump layout).
 
 ---
 
-## Step 3 — Fix PSC UART TX if output still missing after EXT is fixed
+## Phase 3+ (out of scope, for context)
 
-If EXT starts being handled without faults but no characters appear on stderr:
-
-- Enable MMIO logging and look for writes to PSC range (0x2000–0x2bff) after ticks start
-- Verify the TX buffer offset: current stub captures `(offset & 0xff) == 0x0c`; adjust if VxWorks writes elsewhere
-- The PSC TX might use a different offset in the FIFO mode (e.g., offset 0x40 in FIFO mode)
-
----
-
-## Step 4 — EEPROM follow-up (if kernel panics after scheduling)
-
-The EEPROM stub only sets board type (data[7]=0x17). If NULL-ptr panics occur after scheduling starts, re-enable MMIO logging, trace I2C reads, and add any missing fields.
-
----
-
-## File to Modify
-
-`hw/ppc/mac_newworld.c` — all stub code is in lines ~79–200 and `ppc_core99_init()`.
-
-**Debug toggle**: MMIO logging disabled with `&& 0` on `log_count` check (line ~132). Remove `&& 0` to enable.
-
-**Debug prints to remove before final commit**:
-- `fprintf(stderr, "MPC5200: init timer, now=...")` in `ppc_core99_init()`
-- `static int tick_count` + `fprintf` in `mpc5200_tick()`
-
----
-
-## Key Reference Addresses (ELF vxworks.out)
-
-| Symbol | Address | Notes |
-|--------|---------|-------|
-| Entry point | 0x00100000 | |
-| `sysClkInt` | 0x00118000 | DEC reload + tickAnnounce — called on SLT interrupt |
-| DEC add-period | 0x00207a28 | adds period to current DEC value |
-| DEC set (simple) | 0x00207a18 | `mtspr DEC, r3; blr` |
-| DECR context-switch | 0x00207f58 | entered when DECR fires |
-| `tickAnnounce` call | 0x001180b8 | inside sysClkInt, advances tick counter |
-| EXT INT vector (RAM) | 0x00000500 | VxWorks handler installed here (~2 s into run) |
-| DECR vector (RAM) | 0x00000900 | VxWorks stub installed here |
-| IC dispatcher | 0x001195b8 | reads IC 0x0504 for priority |
-| Program check vector (RAM) | 0x00000700 | currently loops — HV_EMU lands here |
-
----
-
-## Build & Run (canonical)
-
-```bash
-cd /home/dpi/qemu/build
-ninja qemu-system-ppc
-
-# Capture stderr to file to avoid pipe-buffering hiding output:
-timeout 5 ./qemu-system-ppc -machine mac99 -cpu mpc5200 -m 256 \
-  -device loader,file=/tmp/vxworks_romfs/vxworks.out,cpu-num=0 \
-  -display none -serial null 2>/tmp/qemu_err.txt; cat /tmp/qemu_err.txt
-
-# With interrupt log:
-timeout 5 ./qemu-system-ppc -machine mac99 -cpu mpc5200 -m 256 \
-  -device loader,file=/tmp/vxworks_romfs/vxworks.out,cpu-num=0 \
-  -display none -serial null -d int 2>/tmp/qemu_err.txt
-grep -E "EXTERNAL|HV_EMU|MPC5200" /tmp/qemu_err.txt | head -20
-```
-
-**Note**: Always redirect stderr to a file — pipe to `head` hides output due to buffering.
+Once boot completes:
+- App-layer protocol stubs: Firecrest, AP, Firedrake, NEON
+- VOT connects to single-node Ground (Node 10)
+- Multi-node ARCnet for full controller stack
