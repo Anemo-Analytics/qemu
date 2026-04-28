@@ -977,6 +977,27 @@ static void mpc5200_bestcomm_walk_tx(MPC5200State *s)
 
     if (sent && s->fec) {
         mpc5200_fec_raise_eir(s->fec, MPC5200_FEC_EIR_TXF);
+
+        /*
+         * BSP installs an SDMA task-completion ISR via intConnect(0x27, ...)
+         * for FEC TX (task 2). Set IntPending bit 18 (mask 0x00002000) at
+         * MBAR+0x1214 and assert IC EXT so the BSP's SDMA dispatcher sees
+         * the task is done and recycles BDs. Without this the BSP doesn't
+         * acknowledge TX completion and stalls waiting for more TX work.
+         */
+        {
+            uint32_t intp = ((uint32_t)s->bestcomm[0x14] << 24)
+                          | ((uint32_t)s->bestcomm[0x15] << 16)
+                          | ((uint32_t)s->bestcomm[0x16] <<  8)
+                          |  (uint32_t)s->bestcomm[0x17];
+            intp |= BCOM_INTP_FEC_TX;  /* mask 0x00002000 */
+            s->bestcomm[0x14] = (intp >> 24) & 0xff;
+            s->bestcomm[0x15] = (intp >> 16) & 0xff;
+            s->bestcomm[0x16] = (intp >>  8) & 0xff;
+            s->bestcomm[0x17] =  intp        & 0xff;
+            s->ic_pending = true;
+            ppc_set_irq(s->cpu, PPC_INTERRUPT_EXT, 1);
+        }
     }
 
     fprintf(stderr, "BestComm TX: walk done, frames sent=%u\n", sent);
