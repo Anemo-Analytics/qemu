@@ -160,8 +160,9 @@ typedef struct {
     QEMUTimer       *diag_timer;     /* fast NIP/MSR/DEC sampler */
     PowerPCCPU      *cpu;
     DeviceState     *fec;            /* mpc5200-fec, for executor callbacks */
-    bool             ic_pending;     /* legacy: SLT1 timer pending */
-    bool             ic_fec_pending; /* FEC peripheral interrupt pending */
+    bool             ic_pending;       /* legacy: SLT1 timer pending */
+    bool             ic_fec_pending;   /* FEC peripheral interrupt pending */
+    bool             ic_sdma_pending;  /* SDMA Main IRQ #0 (BestComm task done) */
     MPC5200I2CState  i2c2;
     /*
      * BestComm/SDMA register file (MBAR+0x1200..0x12FF). Modeled as plain
@@ -197,6 +198,70 @@ static void mpc5200_i2c2_init(MPC5200I2CState *i2c)
 #define MPC5200_VEC_GARBAGE_AT_508 0x13e00c08u
 
 /*
+ * Update the CPU EXT line based on the OR of all IC pending sources.
+ * Centralised so we don't have to re-derive the right boolean expression
+ * at every call site that toggles one of the per-source flags.
+ */
+static void mpc5200_update_ext(MPC5200State *s)
+{
+    int lvl = (s->ic_pending || s->ic_fec_pending || s->ic_sdma_pending)
+              ? 1 : 0;
+    ppc_set_irq(s->cpu, PPC_INTERRUPT_EXT, lvl);
+}
+
+/*
+ * Read 32-bit big-endian word from the BestComm register file at
+ * MBAR+0x1200+offset. The register file is byte-addressable; we treat
+ * 4-byte reads as BE.
+ */
+static inline uint32_t mpc5200_bc_get32(MPC5200State *s, unsigned offset)
+{
+    return ((uint32_t)s->bestcomm[offset]     << 24)
+         | ((uint32_t)s->bestcomm[offset + 1] << 16)
+         | ((uint32_t)s->bestcomm[offset + 2] <<  8)
+         |  (uint32_t)s->bestcomm[offset + 3];
+}
+
+static inline void mpc5200_bc_put32(MPC5200State *s, unsigned offset,
+                                    uint32_t v)
+{
+    s->bestcomm[offset]     = (v >> 24) & 0xff;
+    s->bestcomm[offset + 1] = (v >> 16) & 0xff;
+    s->bestcomm[offset + 2] = (v >>  8) & 0xff;
+    s->bestcomm[offset + 3] =  v        & 0xff;
+}
+
+/*
+ * Re-evaluate SDMA Main IRQ pending state.
+ *
+ * IntPending (MBAR+0x1214) bits AND-NOT IntMask (MBAR+0x1218) bits gives
+ * the unmasked-pending set. IntMask convention: 1=MASKED, 0=ENABLED
+ * (verified via vxworks 0x12e8e0: clearing a bit *enables* the task's
+ * IRQ). If any bit is unmasked-pending, we assert the SDMA Main IRQ
+ * line (which the IC encodes as PerStat=0x20000000 — main valid bit
+ * set, main source = 0).
+ */
+static void mpc5200_sdma_eval_irq(MPC5200State *s)
+{
+    uint32_t intp = mpc5200_bc_get32(s, 0x14);
+    uint32_t mask = mpc5200_bc_get32(s, 0x18);
+    bool was_pending = s->ic_sdma_pending;
+    s->ic_sdma_pending = (intp & ~mask) != 0;
+    if (s->ic_sdma_pending != was_pending) {
+        static unsigned log = 0;
+        if (log++ < 32) {
+            fprintf(stderr,
+                    "SDMA IRQ %s: IntPending=0x%08x IntMask=0x%08x "
+                    "unmasked=0x%08x\n",
+                    s->ic_sdma_pending ? "RAISE" : "CLEAR",
+                    intp, mask, intp & ~mask);
+            fflush(stderr);
+        }
+    }
+    mpc5200_update_ext(s);
+}
+
+/*
  * Hook to route the FEC's level-sensitive IRQ output into the EXT path.
  * The IC dispatch (0x524 PerStat/MainStat encoded register) needs to
  * report this as peripheral source 5 (Ethernet) routed via Main
@@ -212,15 +277,8 @@ static void mpc5200_fec_irq_handler(void *opaque, int n, int level)
         fprintf(stderr, "FEC IRQ -> %d\n", level);
         fflush(stderr);
     }
-    if (level) {
-        s->ic_fec_pending = true;
-        ppc_set_irq(s->cpu, PPC_INTERRUPT_EXT, 1);
-    } else {
-        s->ic_fec_pending = false;
-        if (!s->ic_pending) {
-            ppc_set_irq(s->cpu, PPC_INTERRUPT_EXT, 0);
-        }
-    }
+    s->ic_fec_pending = !!level;
+    mpc5200_update_ext(s);
 }
 
 /*
@@ -688,8 +746,67 @@ static void mpc5200_tick(void *opaque)
     }
     s->ic_pending = true;
     if (ext_armed) {
-        ppc_set_irq(s->cpu, PPC_INTERRUPT_EXT, 1);
+        mpc5200_update_ext(s);
     }
+
+    /*
+     * Once-per-second TCB dump: identifies which VxWorks task is
+     * currently running and what it's blocked on. Per agent
+     * investigation 2026-04-29, taskIdCurrent lives at ramBase+0x9084a8;
+     * TCB layout: +0x34 name (char*), +0x3C status (0=READY, 2=PEND,
+     * 4=DELAY, 6=PEND+TIMEOUT), +0x5C pSemId, +0x7C saved SP.
+     * Status decoding helps tell us whether the BSP is blocked on an
+     * IRQ that never fires (PEND on sem) vs a TCP timeout (DELAY on
+     * tsleep) vs idle (running tShell).
+     */
+    /*
+     * Once-per-second full task-list dump. Walks the DLL anchored at
+     * activeQHead (vxworks.out BSS @ 0x008d94e4) — head pointer is
+     * *(0x008d94e4); each node is at TCB+0x20; next-link = *(node+0).
+     * Per agent investigation 2026-04-29.
+     *
+     * For each task we report: name, priority, status, pSemId, saved
+     * PC/LR (REG_SET starts at TCB+0x130; PC=+0x1BC, LR=+0x1B4). Status
+     * 0x2=PEND, 0x4=DELAY, 0x6=PEND+TIMEOUT. The saved PC tells us
+     * exactly which kernel routine each task is blocked in.
+     */
+    if ((tick_count % 60) == 0 && tick_count <= 60 * 90) {
+        AddressSpace *as = &address_space_memory;
+        const uint32_t ACTIVEQ_HEAD = 0x008d94e4;
+        uint32_t cur = ldl_be_phys(as, ACTIVEQ_HEAD);
+        fprintf(stderr, "=== task list t=%ds (activeQHead=0x%08x) ===\n",
+                tick_count / 60, cur);
+        for (int n = 0; n < 64 && cur && cur != ACTIVEQ_HEAD; n++) {
+            uint32_t tcb     = cur - 0x20;
+            uint32_t name_pa = ldl_be_phys(as, tcb + 0x34);
+            uint32_t status  = ldl_be_phys(as, tcb + 0x3C);
+            uint32_t prio    = ldl_be_phys(as, tcb + 0x40);
+            uint32_t pSemId  = ldl_be_phys(as, tcb + 0x5C);
+            uint32_t errnov  = ldl_be_phys(as, tcb + 0x84);
+            uint32_t pc      = ldl_be_phys(as, tcb + 0x130 + 0x8C);
+            uint32_t lr      = ldl_be_phys(as, tcb + 0x130 + 0x84);
+            uint32_t sp      = ldl_be_phys(as, tcb + 0x130 + 0x04);
+            char nm[20] = {0};
+            if (name_pa && name_pa < 0x10000000) {
+                cpu_physical_memory_read(name_pa, (uint8_t *)nm, 19);
+            }
+            const char *st = "?";
+            switch (status) {
+            case 0x0:     st = "READY"; break;
+            case 0x2:     st = "PEND"; break;
+            case 0x4:     st = "DELAY"; break;
+            case 0x6:     st = "PEND+TO"; break;
+            case 0x10000: st = "SUSP"; break;
+            }
+            fprintf(stderr,
+                    "  [%2d] tcb=0x%08x %-16s prio=%3u %-8s "
+                    "sem=0x%08x errno=0x%08x PC=0x%08x LR=0x%08x SP=0x%08x\n",
+                    n, tcb, nm, prio, st, pSemId, errnov, pc, lr, sp);
+            cur = ldl_be_phys(as, cur);  /* DLL_NODE.next */
+        }
+        fflush(stderr);
+    }
+
     timer_mod(s->timer,
               qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 16666667ULL); /* ~60 Hz */
 }
@@ -737,17 +854,36 @@ static uint64_t mpc5200_mmio_read(void *opaque, hwaddr offset, unsigned size)
      * Read-to-clear: deassert EXT after the handler reads us. The level
      * will re-assert if a source is still active.
      */
-    if (offset == 0x0524 && s->ic_fec_pending) {
-        s->ic_fec_pending = false;
-        if (!s->ic_pending) {
-            ppc_set_irq(s->cpu, PPC_INTERRUPT_EXT, 0);
+    /*
+     * SDMA Main IRQ #0 (BestComm task done). Per agent investigation
+     * 2026-04-29 of the EXT dispatch decoder at vxworks 0x1178f0:
+     *   - Main lane test: r31 & 0x3F000000 (PPC bits 2..7 = valid+5-bit src)
+     *   - Source ID extract: (r31 >> 24) & 0x1F → vector 0..31
+     * SDMA Main ISR (0x132854) is registered on Main IRQ #0 via
+     * intConnect(0, 0x132854, ...) at 0x1329a0. So PerStat must encode
+     * source=0 with the valid bit set. The minimum valid encoding is
+     * 0x20000000 (just bit 2 PPC; source-ID = 0).
+     *
+     * We do NOT auto-clear ic_sdma_pending here — the BSP's per-task
+     * callback W1C-clears IntPending at 0x1214, and our W1C handler
+     * re-evaluates the SDMA IRQ. The IC dispatch decoder reads PerStat
+     * each time the EXT vector enters; if the source is still pending,
+     * we re-report it.
+     */
+    if (offset == 0x0524) {
+        if (s->ic_fec_pending) {
+            return 0x25240000;
         }
-        return 0x25240000;
-    }
-    if (offset == 0x0524 && s->ic_pending) {
-        s->ic_pending = false;
-        ppc_set_irq(s->cpu, PPC_INTERRUPT_EXT, 0);
-        return 0x40000000;
+        if (s->ic_sdma_pending) {
+            return 0x20000000;
+        }
+        if (s->ic_pending) {
+            /* SLT1 timer — legacy path; read-to-clear. */
+            s->ic_pending = false;
+            mpc5200_update_ext(s);
+            return 0x40000000;
+        }
+        return 0;
     }
 
     /* BestComm/SDMA register file: byte-addressable RAM. Big-endian. */
@@ -979,25 +1115,17 @@ static void mpc5200_bestcomm_walk_tx(MPC5200State *s)
         mpc5200_fec_raise_eir(s->fec, MPC5200_FEC_EIR_TXF);
 
         /*
-         * BSP installs an SDMA task-completion ISR via intConnect(0x27, ...)
-         * for FEC TX (task 2). Set IntPending bit 18 (mask 0x00002000) at
-         * MBAR+0x1214 and assert IC EXT so the BSP's SDMA dispatcher sees
-         * the task is done and recycles BDs. Without this the BSP doesn't
-         * acknowledge TX completion and stalls waiting for more TX work.
+         * BSP's SDMA Main ISR (vxworks 0x132854, registered on Main IRQ
+         * #0 by intConnect at 0x1329a0) reads MBAR+0x1214 IntPending,
+         * ANDs against ~MBAR+0x1218 IntMask, and dispatches per-task
+         * callbacks. For FEC TX (task 2) we set bit 2 (LSB) and let the
+         * SDMA-IRQ evaluator decide whether to assert EXT (it checks
+         * IntMask first). Without this the BSP never sees TX completion
+         * and stalls.
          */
-        {
-            uint32_t intp = ((uint32_t)s->bestcomm[0x14] << 24)
-                          | ((uint32_t)s->bestcomm[0x15] << 16)
-                          | ((uint32_t)s->bestcomm[0x16] <<  8)
-                          |  (uint32_t)s->bestcomm[0x17];
-            intp |= BCOM_INTP_FEC_TX;  /* mask 0x00002000 */
-            s->bestcomm[0x14] = (intp >> 24) & 0xff;
-            s->bestcomm[0x15] = (intp >> 16) & 0xff;
-            s->bestcomm[0x16] = (intp >>  8) & 0xff;
-            s->bestcomm[0x17] =  intp        & 0xff;
-            s->ic_pending = true;
-            ppc_set_irq(s->cpu, PPC_INTERRUPT_EXT, 1);
-        }
+        uint32_t intp = mpc5200_bc_get32(s, 0x14);
+        mpc5200_bc_put32(s, 0x14, intp | BCOM_INTP_FEC_TX);
+        mpc5200_sdma_eval_irq(s);
     }
 
     fprintf(stderr, "BestComm TX: walk done, frames sent=%u\n", sent);
@@ -1086,6 +1214,15 @@ static void mpc5200_bestcomm_rx_hook(const uint8_t *buf, size_t len)
     if (s->fec) {
         mpc5200_fec_raise_eir(s->fec, MPC5200_FEC_EIR_RXF);
     }
+
+    /*
+     * Set SDMA IntPending bit 3 (FEC RX = task 3) and re-evaluate.
+     * BSP unmasks bit 3 in IntMask when the RX task is enabled; this
+     * fires the SDMA Main ISR which dispatches to the FEC RX callback.
+     */
+    uint32_t intp = mpc5200_bc_get32(s, 0x14);
+    mpc5200_bc_put32(s, 0x14, intp | BCOM_INTP_FEC_RX);
+    mpc5200_sdma_eval_irq(s);
 }
 
 /* Forward decl for the FEC -> BestComm RX hook installer. */
@@ -1096,10 +1233,16 @@ static void mpc5200_mmio_write(void *opaque, hwaddr offset,
 {
     MPC5200State *s = opaque;
 
-    /* IC register write: ack interrupt and deassert */
+    /*
+     * IC register write: ack legacy SLT path. We deliberately do NOT
+     * clear ic_fec_pending or ic_sdma_pending here — those are level-
+     * sensitive sources that clear when their underlying IRQ register
+     * (FEC EIR / SDMA IntPending) is acked by the BSP. Spurious clears
+     * would silently drop FEC TX/RX completion IRQs.
+     */
     if (offset >= 0x0500 && offset <= 0x052c) {
         s->ic_pending = false;
-        ppc_set_irq(s->cpu, PPC_INTERRUPT_EXT, 0);
+        mpc5200_update_ext(s);
         return;
     }
     /* BestComm/SDMA register file: store as bytes (BE), match access size. */
@@ -1109,9 +1252,28 @@ static void mpc5200_mmio_write(void *opaque, hwaddr offset,
         if (size < 4) {
             v &= ((uint64_t)1 << (8 * size)) - 1;
         }
+        /*
+         * IntPending (MBAR+0x1214) is W1C — writing 1 to a bit clears it.
+         * The BSP's per-task ACK helper (vxworks 0x12e888) does
+         * `stw (1<<taskID), MBAR+0x1214` to acknowledge a task IRQ.
+         */
+        if (offset == 0x1214 && size == 4) {
+            uint32_t cur = mpc5200_bc_get32(s, 0x14);
+            uint32_t bits = (uint32_t)v;
+            mpc5200_bc_put32(s, 0x14, cur & ~bits);
+            mpc5200_sdma_eval_irq(s);
+            return;
+        }
         for (int k = (int)size - 1; k >= 0 && (i + k) < 0x100; k--) {
             s->bestcomm[i + k] = v & 0xff;
             v >>= 8;
+        }
+        /*
+         * IntMask (MBAR+0x1218) writes can change which bits are
+         * unmasked-pending — re-evaluate the SDMA IRQ line.
+         */
+        if (offset >= 0x1218 && offset < 0x121C) {
+            mpc5200_sdma_eval_irq(s);
         }
         /* Diagnostic: log all BestComm config writes (first ~64) with caller NIP. */
         {

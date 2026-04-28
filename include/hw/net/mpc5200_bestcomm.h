@@ -100,9 +100,15 @@
 #define BCOM_TCR_TX_OFFSET          0x1220   /* MBAR-relative */
 #define BCOM_TCR_RX_OFFSET          0x1222
 
-/* IntPending / IntMask bit indices for FEC tasks (MBAR+0x1214 / 0x1218).
- * MSB=0 numbering: TASK[N] is at bit 16+N. */
-#define BCOM_INTP_FEC_TX            (1U << (31 - (16 + 2)))   /* 0x2000 */
-#define BCOM_INTP_FEC_RX            (1U << (31 - (16 + 3)))   /* 0x1000 */
+/* IntPending / IntMask bit indices for SDMA tasks (MBAR+0x1214 / 0x1218).
+ *
+ * Per agent investigation 2026-04-29 of vxworks SDMA Main ISR (0x132854) and
+ * per-task ACK helper (0x12e888): the BSP writes `(1 << taskID)` to W1C-clear
+ * IntPending, where taskID is the slot number (LSB=0 numbering). FEC TX is
+ * task 2, FEC RX is task 3. IntMask uses the same numbering — 1=MASKED,
+ * 0=ENABLED. Init writes 0xFFFFFFFF to IntMask (all masked); BSP unmasks
+ * individual tasks when enabling them. */
+#define BCOM_INTP_FEC_TX            (1U << 2)   /* 0x00000004 */
+#define BCOM_INTP_FEC_RX            (1U << 3)   /* 0x00000008 */
 
 #endif /* HW_NET_MPC5200_BESTCOMM_H */
