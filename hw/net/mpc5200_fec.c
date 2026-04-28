@@ -173,19 +173,24 @@ static void mpc5200_fec_mmfr_write(MPC5200FECState *s, uint32_t value)
     s->regs[FEC_MMFR / 4] = value;
 
     /*
-     * We model a single PHY but respond on whichever address the driver
-     * queries — the Vestas BSP probes at PA=0 while the QEMU default
-     * was 1, causing the BSP to see "no PHY" and stop its MII polling.
-     * Treat phy_addr as the *advertised* address but still answer
-     * on others, so any board's probing pattern gets a useful response.
+     * Respond as a single PHY at exactly s->phy_addr. If the BSP
+     * scans multiple addresses (e.g. PA=0, 1, 16) it must see a
+     * single responding PHY — replying everywhere confuses the
+     * scan and the BSP loops forever trying to pick one.
      */
-    (void)pa; /* PHY address ignored — single embedded PHY answers all */
-
-    if (op == 1) { /* write */
-        lan9118_phy_write(&s->mii, ra, data);
-    } else if (op == 2) { /* read */
-        uint16_t r = lan9118_phy_read(&s->mii, ra);
-        s->regs[FEC_MMFR / 4] = (value & ~(uint32_t)MMFR_DATA_MASK) | r;
+    if (pa == s->phy_addr) {
+        if (op == 1) { /* write */
+            lan9118_phy_write(&s->mii, ra, data);
+        } else if (op == 2) { /* read */
+            uint16_t r = lan9118_phy_read(&s->mii, ra);
+            s->regs[FEC_MMFR / 4] = (value & ~(uint32_t)MMFR_DATA_MASK) | r;
+        }
+    } else {
+        /* No PHY at that address — return all-ones on read. */
+        if (op == 2) {
+            s->regs[FEC_MMFR / 4] = (value & ~(uint32_t)MMFR_DATA_MASK)
+                                  | 0xFFFF;
+        }
     }
 
     s->regs[FEC_EIR / 4] |= EIR_MII;
@@ -380,6 +385,15 @@ static void mpc5200_fec_realize(DeviceState *dev, Error **errp)
                           object_get_typename(OBJECT(dev)),
                           dev->id, &dev->mem_reentrancy_guard, s);
     qemu_format_nic_info_str(qemu_get_queue(s->nic), s->conf.macaddr.a);
+
+    /*
+     * Force PHY link up. SLIRP-backed NICs report link up by default,
+     * but the order of nic-realize / phy-reset / link-status-changed
+     * means the PHY's status register may have been initialized with
+     * link_down=true. Forcing it after realize guarantees BMSR has
+     * AN_COMP|LINK_ST set when the BSP polls it.
+     */
+    lan9118_phy_update_link(&s->mii, false);
 }
 
 static void mpc5200_fec_init(Object *obj)
@@ -390,7 +404,7 @@ static void mpc5200_fec_init(Object *obj)
 
 static const Property mpc5200_fec_properties[] = {
     DEFINE_NIC_PROPERTIES(MPC5200FECState, conf),
-    DEFINE_PROP_UINT8("phy-addr", MPC5200FECState, phy_addr, 0x01),
+    DEFINE_PROP_UINT8("phy-addr", MPC5200FECState, phy_addr, 0x00),
 };
 
 static const VMStateDescription vmstate_mpc5200_fec = {
