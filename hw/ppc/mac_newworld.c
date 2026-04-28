@@ -50,6 +50,7 @@
 #include "qemu/datadir.h"
 #include "qemu/units.h"
 #include "qemu/timer.h"
+#include "exec/address-spaces.h"
 #include "qapi/error.h"
 #include "hw/ppc/ppc.h"
 #include "hw/qdev-properties.h"
@@ -168,16 +169,43 @@ static void mpc5200_i2c2_init(MPC5200I2CState *i2c)
     memcpy(i2c->eeprom, mpc5200_eeprom_init, sizeof(mpc5200_eeprom_init));
 }
 
+/*
+ * Word at physical 0x508 in the freshly-loaded vxworks.out image. We treat
+ * any value other than this as evidence that VxWorks has installed a real
+ * EXT handler at vector 0x500, after which delivering EXT is safe. Until
+ * then, EXT delivery bounces into garbage and HV_EMU-loops forever.
+ *
+ * The literal `0x13e00c08` decodes (incorrectly, on G2) as the AltiVec
+ * `vpmsumb` opcode and is what triggered the original loop.
+ */
+#define MPC5200_VEC_GARBAGE_AT_508 0x13e00c08u
+
 static void mpc5200_tick(void *opaque)
 {
     MPC5200State *s = opaque;
-    static int tick_count = 0;
+    static int  tick_count = 0;
+    static bool ext_armed  = false;
+
+    if (!ext_armed) {
+        uint32_t w = ldl_be_phys(&address_space_memory, 0x508);
+        if (w != MPC5200_VEC_GARBAGE_AT_508) {
+            ext_armed = true;
+            fprintf(stderr,
+                    "MPC5200: EXT vector populated (word@0x508=0x%08x), "
+                    "arming EXT delivery\n", w);
+            fflush(stderr);
+        }
+    }
+
     if (tick_count++ < 3) {
-        fprintf(stderr, "MPC5200: tick #%d, asserting EXT\n", tick_count);
+        fprintf(stderr, "MPC5200: tick #%d, ic_pending=1, ext_armed=%d\n",
+                tick_count, ext_armed);
         fflush(stderr);
     }
     s->ic_pending = true;
-    ppc_set_irq(s->cpu, PPC_INTERRUPT_EXT, 1);
+    if (ext_armed) {
+        ppc_set_irq(s->cpu, PPC_INTERRUPT_EXT, 1);
+    }
     timer_mod(s->timer,
               qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 16666667ULL); /* ~60 Hz */
 }
@@ -186,7 +214,7 @@ static void mpc5200_tick(void *opaque)
 static void mpc5200_log_access(const char *rw, hwaddr offset, uint64_t val, unsigned size)
 {
     static uint64_t log_count = 0;
-    if (log_count < 2000 && 0) { /* disabled temporarily */
+    if (log_count < 2000 && 0) { /* disabled — re-enable for diagnosis */
         fprintf(stderr, "MPC5200 %s off=0x%05x sz=%u val=0x%08x\n",
                 rw, (unsigned)offset, size, (unsigned)val);
         log_count++;
@@ -201,12 +229,18 @@ static uint64_t mpc5200_mmio_read(void *opaque, hwaddr offset, unsigned size)
 {
     MPC5200State *s = opaque;
 
-    /* IC: ICTL_MAIN_TASK_PRIO_ACTIVE_PEND — identify Slice Timer 1 as active source */
+    /* IC: ICTL_MAIN_TASK_PRIO_ACTIVE_PEND — SLT1 as active source */
     if (offset == 0x0508 && s->ic_pending) {
-        return 0x00000001; /* SLT1 = source 1 in active field */
+        return 0x00000001;
     }
-    /* IC: ICTL_MAIN_PEND — bit 30 = SLT1 pending */
+    /*
+     * IC: PerEnc (Peripheral Encoded) — read by EXT handler to dispatch.
+     * Bit 30 indicates SLT1 as active source. Read-to-clear deasserts EXT
+     * here so the handler returning via rfi doesn't immediately re-fire.
+     */
     if (offset == 0x0524 && s->ic_pending) {
+        s->ic_pending = false;
+        ppc_set_irq(s->cpu, PPC_INTERRUPT_EXT, 0);
         return 0x40000000;
     }
 
@@ -833,7 +867,7 @@ static void ppc_core99_init(MachineState *machine)
     mpc5200->cpu = POWERPC_CPU(first_cpu);
     mpc5200_i2c2_init(&mpc5200->i2c2);
     mpc5200->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, mpc5200_tick, mpc5200);
-    /* delay first tick by 1 s of guest time to let BSP install interrupt vectors */
+    /* delay first tick by 1 s of guest time to let BSP run early init */
     {
         int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
         fprintf(stderr, "MPC5200: init timer, now=%"PRId64"\n", now);
