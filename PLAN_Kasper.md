@@ -8,17 +8,45 @@
 
 ---
 
+## Reference docs (local copies committed to repo)
+
+- `docs/MPC5200_Users_Guide.pdf` — full 732-page MPC5200UG Rev 3.1
+  (03/2006). NXP source.
+- `docs/MPC5200_FEC_Chapter14.pdf` — Chapter 14 only, ~56 pages.
+- `docs/MPC5200_BestComm_Chapter13.pdf` — Chapter 13 (SDMA/BestComm),
+  ~30 pages.
+
 ## Why this exists
 
 Kernel parks at NIP `0x207fe8` after all current peripheral stubs init
 clean. Hypothesis (see `PLAN_Daniele.md` for verification): boot-mode
-FTP wait at link-local 169.254.254.254. The FEC stub currently returns plausible
-config-register reads but moves no packets — RX poll never produces a
-frame, so the boot loop stalls.
+FTP wait at link-local 169.254.254.254. The FEC stub currently returns
+plausible config-register reads but moves no packets — RX poll never
+produces a frame, so the boot loop stalls.
 
 This track builds the missing FEC device and the host-side FTP
-plumbing so packets actually flow. If the hypothesis holds, the kernel proceeds and
-we get our first serial banner.
+plumbing so packets actually flow. If the hypothesis holds, the kernel
+proceeds and we get our first serial banner.
+
+## Hard architectural constraint (from manual page 14-1)
+
+> "BestComm data transfers are interrupt driven. **Interrupt driven
+> data movement from the processor is not supported.**"
+
+The FEC cannot move TX/RX data via direct register access — it
+**requires** BestComm DMA. A naive fork of `imx_fec.c` (which assumes
+processor-driven BD walking) will not produce packet flow.
+
+Implication: this track now has two parts that cannot be skipped.
+1. FEC register/CSR model (control, status, MII, link).
+2. **BestComm task executor** — interpret writes to SDMA Task Control
+   Registers (MBAR+0x121C/0x121E etc.), parse task descriptors stored
+   in internal SRAM, execute as DMA copies between system memory and
+   the FEC FIFO, fire task-done interrupts.
+
+The current `bestcomm[0x100]` and `sram[0x8000]` register-as-RAM stubs
+become the *backing store* for the executor — they're necessary but
+not sufficient.
 
 ---
 
@@ -182,24 +210,30 @@ hypothesis. Pivot using Daniele's findings.
 
 ## Risks and unknowns
 
-1. **Register layout differs from i.MX6 in non-obvious ways** — BD
-   format details, MII frame access. Need MPC5200 FEC manual section
-   26, not just observed offsets. Mitigation: get the manual before
-   coding the BD walker.
+1. **Register layout differs from i.MX6 in non-obvious ways** —
+   ~~Need MPC5200 FEC manual~~. **Resolved:** manual is now in
+   `docs/MPC5200_FEC_Chapter14.pdf`. Read it before coding the BD
+   walker.
 
-2. **BestComm DMA dependency** — BSP may use BestComm DMA tasks for
-   FEC TX/RX rather than direct register MMIO (same blocker pattern as
-   PSC). If so, FEC packets won't actually move and we'd need to model
-   BestComm task execution: sniff source buffer, write to host netdev,
-   fire task-done interrupt. Mitigation: check BSP code path during
-   FEC init for BestComm task setup; if observed, add BestComm
-   executor as Phase 2b.
+2. ~~**BestComm DMA dependency may exist**~~ — **Confirmed by
+   manual**, see "Hard architectural constraint" above. Now part of
+   the plan, not a risk. The executor must be built; the question is
+   whether to build a minimal "task interpreter for FEC tasks only"
+   or a general one.
 
 3. **Proprietary upload protocol** — Vault references "Falcon" and
    "Snoopy WCF" but doesn't fully document the boot-mode upload
    protocol. Probably standard FTP given APIPA pattern, not
    guaranteed. Daniele is checking this. If proprietary, swap vsftpd
    for a Python protocol shim.
+
+4. **BestComm microcode** — real BestComm tasks are programs in a
+   small instruction set executed by the SDMA engine. We do not need
+   to interpret the microcode; the BSP will program the engine, and
+   we observe the *effect* (which buffer to copy from, which BD to
+   update). But we need to identify in the BSP which task slots are
+   used for FEC TX/RX, and what their source/dest fields point at.
+   This is BSP reverse-engineering — overlaps with Daniele's work.
 
 ---
 

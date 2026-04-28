@@ -54,6 +54,9 @@ Sub-questions:
 
 ## Inputs
 
+- **MPC5200 manual:** `docs/MPC5200_Users_Guide.pdf` (full),
+  `docs/MPC5200_BestComm_Chapter13.pdf`,
+  `docs/MPC5200_FEC_Chapter14.pdf`.
 - **Binary:** `/tmp/vxworks_romfs/vxworks.out` — VxWorks 5.5.1 PowerPC
   ELF, ~14 MB. Symbol table preserved.
 - **Current QEMU state:** `mpc5200-stub` HEAD at commit `9ec6a690fd`.
