@@ -1,87 +1,119 @@
-# Plan: Boot VxWorks MPC5200B in QEMU
+# Plan: Boot VxWorks MPC5200B in QEMU & connect the VMP6000 Toolkit
 
-**End goal:** VOT (Vestas Online Toolkit) connects to QEMU and treats it as
-a live CT6003 turbine controller. Single-node Ground (Node 10) PoC first;
-multi-node ARCnet later.
+## End goal
+
+**The VMP6000 Toolkit (running on a Windows VM) connects to our QEMU
+turbine, recognises it as a CT6003, and successfully performs a
+software-load operation against it** — i.e. the toolkit can push
+firmware/parameters/binaries to QEMU as if it were a real turbine.
+
+That's the validation that QEMU is "real enough". Everything below
+ladders up to that.
 
 ---
 
-## Honest status — how far to the target
+## Roadmap & verification gates
 
-End goal: **VOT connects to QEMU and treats it as a live CT6003**.
-Estimate of progress: **~20–25% of the way there.**
+Each row below is a discrete, demoable milestone with a concrete
+verification command. We don't move on until the previous gate
+verifies.
 
-### Phase-by-phase breakdown
+| # | Milestone | What you'd see | Verification | Status |
+|---|---|---|---|---|
+| **0** | QEMU builds, kernel loads | `vxworks.out` loaded at `0x100000`, CPU executes | `ninja -C build qemu-system-ppc` succeeds; kernel runs | ✅ |
+| **1** | Stable scheduler, no exception loops | `-d int` shows only `DECR`/`EXTERNAL`, never `HV_EMU` or `PROGRAM` | `grep -oE "=> [A-Z_]+" /tmp/qemu_int.txt \| sort \| uniq -c` | ✅ |
+| **2** | BSP reaches FEC init | FEC register writes show up — ECR reset, MAC programmed, MII clock divider, MII frame issued | grep `^FEC W` in QEMU log | ✅ (this session) |
+| **3** | BestComm executor — TX | When BSP enables TCR[2]=0xC2, our executor walks the BD ring and `qemu_send_packet`s the frame | Wireshark/tcpdump on host loopback shows guest-originated TCP SYN to 169.254.254.252:21 | 🟡 NEXT |
+| **4** | BestComm executor — RX | FTP server's SYN-ACK reaches the kernel; BSP sees frame in RX BD ring | FTP server logs accept the connection from guest IP `.254` (not just QEMU's startup probe) | ⏳ |
+| **5** | FTP boot completes | Anonymous login OK, `ct6003/vxworks` retrieved fully | FTP log shows `RETR ct6003/vxworks` + transfer size = full file | ⏳ |
+| **6** | First serial banner | Kernel emits PSC TX after image is loaded into RAM and runmode entered | `PSC_TX[…]: …` log lines appear for ASCII printable text | ⏳ |
+| **7** | Filesystem available | `/ata0a/` mounts, `etc/startup.app` found | grep for `dosFsDevInit` success / `iosDevShow` output via monitor | ⏳ |
+| **8** | Application boots | `startup.app` runs, Vestas turbine application initializes | banner says `Wind World ...` or task list shows turbine app names (`tApMain`, `tFirecrest`, etc.) | ⏳ |
+| **9** | Network listener up | App opens AP / Firecrest / Firedrake ports | `nmap -p 8080,9482,...` from host shows listening ports | ⏳ |
+| **10** | Toolkit recognizes turbine | VMP6000 Toolkit lists our QEMU under "available turbines" with the right board ID | Toolkit UI screenshot showing CT6003_Motherboard_V3 entry | ⏳ |
+| **11** | Toolkit reads parameters | Toolkit reads a parameter (e.g. RatedPower) and gets a plausible value | Toolkit UI shows non-zero value, not "comm error" | ⏳ |
+| **12** | **Toolkit performs software load** | Toolkit pushes a firmware/binary file via Firedrake/AP and the turbine accepts it | Toolkit UI shows "load successful" + QEMU logs the FTP/Firedrake receive | ⏳ **END GOAL** |
 
-| Phase | What it means | Status | Effort remaining |
-|---|---|---|---|
-| 0. Toolchain + load image | QEMU builds, vxworks.out loads, CPU executes | ✅ DONE | 0 |
-| 1. Stable scheduler | Kernel runs, no exception loops, peripheral stubs init clean | ✅ DONE | 0 |
-| 2a. FEC device model (CSR/MII) | Register layout, MII access, link state, IRQ wiring | ⏳ NOT STARTED | ~3 days |
-| 2b. BestComm task executor | Interpret SDMA TCR writes, parse descriptors in SRAM, copy bytes, fire IRQ | ⏳ NOT STARTED — REQUIRED per manual page 14-1 | ~3–7 days (highest uncertainty) |
-| 2c. Host-side FTP plumbing | vsftpd or pyftpdlib serving `ct6003/vxworks` at 169.254.254.252 | ⏳ NOT STARTED | ~½ day |
-| 2d. First serial banner | Kernel completes FTP boot, prints banner | ⏳ Gates on 2a+2b+2c | ½–1 day debug |
-| 2.5. Filesystem mount | Node 10 dump readable from VxWorks | 🟡 SCOPE UNCLEAR | ~2–3 days if needed |
-| 3a. App layer: Firecrest | Stub enough of the protocol that VOT reaches it | 🔴 NOT INVESTIGATED | weeks |
-| 3b. App layer: AP | Vestas Application Protocol (parameter read/write) | 🔴 NOT INVESTIGATED | weeks |
-| 3c. App layer: Firedrake | File transfer protocol on port 9482 | 🔴 NOT INVESTIGATED | days |
-| 3d. App layer: NEON | Subscription / live data | 🔴 NOT INVESTIGATED | weeks |
-| 4. VOT actually connects | VOT recognises the QEMU instance as a turbine | 🔴 GATES ON ALL OF 3 | unknown |
-| 5. Multi-node ARCnet | Simulate the rest of the controller stack | 🔴 OUT OF SCOPE for PoC | not estimated |
+### Where we are: gate **2 just cleared, working on 3.**
 
-### What's CONFIRMED vs HYPOTHETICAL
+That's about **25% along the bar to gate 12.** Gates 3–6 are
+mechanical (~1–2 weeks). Gates 7–9 are scoping unknowns (days each
+once the path is clear). Gates 10–12 are the **long pole** —
+weeks to months because we have to reverse-engineer enough of
+Vestas-proprietary protocols (AP, Firecrest, Firedrake, NEON) for
+the toolkit to be satisfied.
+
+### What's CONFIRMED vs HYPOTHETICAL right now
 
 **Confirmed (evidence in repo):**
-- Kernel boots and reaches the windExit idle loop (Daniele's diagnosis)
-- App tasks block on FTP boot completion (Daniele's diagnosis)
-- FEC requires BestComm DMA — not optional (manual page 14-1 quote)
-- Boot server: `169.254.254.252`, anonymous FTP, file `ct6003/vxworks`
-- Cold-start alternative `tffs=0,0(0,0)` exists but requires NAND model
+- Kernel boots and reaches windExit idle loop (Daniele's diagnosis)
+- App tasks block on anonymous FTP boot from `169.254.254.252` —
+  user `anonymous`, password `test@cotas.dk`, file `ct6003/vxworks`
+- FEC requires BestComm DMA — not optional (manual page 14-1)
+- BSP reaches FEC init and runs the full register init sequence
+  (this session — log captured)
+- FEC TX uses BestComm task slot 2 (TCR @ MBAR+0x1220), RX uses
+  slot 3 (TCR @ MBAR+0x1222), enable pattern `sth 0xC0|slot`
+  (BSP investigation)
+- Cold-start via `tffs=0,0(0,0)` bootline exists as alt path
 
 **Hypothetical (not yet validated):**
-- That a working FEC + BestComm + FTP gets us a serial banner. (Plausible
-  — Daniele showed all app tasks block on this — but we haven't *seen*
-  it work end-to-end yet.)
-- That VOT will accept the QEMU instance once Phase 3 protocols are
-  stubbed enough. We don't know how strict VOT's identity/protocol
-  checks are.
-- That a single-node Ground configuration is enough — VOT might
-  require ARCnet multi-node for any meaningful interaction.
-- That Phase 3 protocols can be stubbed at all without writing real
-  state machines that match real turbine behavior.
+- That FTP boot, once it succeeds, leads to runmode without
+  additional gating (RTC sanity? key-switch check? Daniele noticed
+  a `CT296 KeySwitch` string that gates Ethernet on a physical
+  hardware key)
+- That a single-node Ground configuration is enough for the
+  toolkit to be satisfied — multi-node ARCnet may be required
+- That the AP/Firecrest/Firedrake stack can be stubbed without
+  fully implementing each protocol's state machine
+- That the toolkit accepts our QEMU as a turbine purely on
+  network-protocol grounds (vs. some hardware identity check we
+  haven't surfaced)
 
-### Biggest unknowns (in rough order of risk)
+### Biggest unknowns (in rough order of risk to the end goal)
 
-1. **BestComm executor complexity.** We know it's required, but we
-   don't yet know how the BSP wires up FEC tasks (which task slots,
-   what descriptor layout). Could be 2 days or 7. Track A overlap may
-   surface this faster.
-2. **Phase 3 effort.** Stubbing four Vestas-proprietary
-   application-layer protocols. We have decompiled VOT-side code (per
-   CLAUDE.md vault references) so it's not blind, but it's a lot of
-   code to mirror.
-3. **VOT acceptance criteria.** What makes VOT decide "yes this is a
-   real turbine"? Identity? Specific signal subscriptions returning
-   plausible values? We don't know yet.
-4. **Multi-node necessity.** If VOT needs Ground + Top + Hub at
-   minimum, single-node PoC is fundamentally insufficient and we add
-   ARCnet emulation as a hard dependency.
+1. **Toolkit acceptance criteria.** We have decompiled toolkit code
+   (per CLAUDE.md: AP_PROTOCOL_REFERENCE.md, COMPLETE_CONNECTION_FLOW
+   docs in `~/Documents/SharedWithXP/Toolkit/`) but we haven't yet
+   reverse-engineered the *minimum* set of protocol responses that
+   convince it we're real. This is gate 10–11 work and could be the
+   difference between a 1-month and 6-month finish line.
+2. **Multi-node necessity.** If the toolkit needs Ground + Top + Hub
+   responses simultaneously, single-node PoC won't pass gate 11. We
+   may need ARCnet emulation as a hard dependency.
+3. **Application boot path.** Even after the kernel boots, getting
+   `etc/startup.app` to actually run the Vestas application stack
+   may surface dependencies on hardware we haven't modeled
+   (CAN, GPIO, ATA, RTC time-of-day, etc.).
+4. **BestComm executor complexity.** Near-term blocker for gate 3.
+   Plan: snoop BSS pointer at `0x008CFC00` (FEC TX config) for the
+   BD ring base, then walk the ring. Could be 1 day or 5 depending
+   on Freescale MOTbcommlib config-struct layout.
 
 ### What this means in practice
 
-- **Phase 2 (Kasper now):** ~1 week of focused work, finite scope,
-  high confidence we'll see a serial banner if the FEC + BestComm +
-  FTP triangle works.
-- **Phase 3 (after Phase 2):** weeks-to-months of less-bounded work
-  reverse-engineering and stubbing application protocols. This is the
-  real long pole.
-- **The "VOT actually treats it as a turbine" milestone** is months
-  of work from where we are now, not days.
+- **Gates 3–6 (next 1–2 weeks):** mechanical, well-scoped. We have
+  the manual, BSP findings, and a working scaffolding. Strong
+  confidence we land this.
+- **Gates 7–9 (couple weeks):** medium uncertainty. Filesystem
+  mounting depends on Daniele's still-pending FS investigation;
+  application bringup may surface new gaps.
+- **Gates 10–12 (months):** the real frontier. Vestas-proprietary
+  protocols. The shape of the work depends entirely on what the
+  toolkit demands — could be "5 message types" or "comprehensive
+  signal namespace + parameter store + live data stream".
 
-If the scope feels too long: the cold-start `tffs` path could let us
-**skip Phase 2 entirely** and jump to Phase 2.5 + Phase 3 with a real
-filesystem from Røye2. Tradeoff is modeling NAND flash instead of FEC
-+ BestComm — different complexity, same end result.
+### Two big shortcut options to keep in mind
+
+- **Cold-start via `tffs=0,0(0,0)`**: model NAND flash instead of
+  FEC+FTP, populate it with the Røye2 dump → skip gates 3–6 entirely
+  and jump straight to a runmode boot from disk. Tradeoff: NAND
+  modeling is its own ~3-day effort. Worth re-evaluating if BestComm
+  executor turns out harder than expected.
+- **Pre-loaded vxworks.out**: skip the FTP altogether and load the
+  *runtime* image directly via `-device loader,file=...`, bypassing
+  the boot-mode protocol. Daniele's findings hint this may be
+  possible by changing the bootline. Could save another week.
 
 ---
 
