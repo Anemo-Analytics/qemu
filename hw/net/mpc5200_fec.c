@@ -172,18 +172,20 @@ static void mpc5200_fec_mmfr_write(MPC5200FECState *s, uint32_t value)
 
     s->regs[FEC_MMFR / 4] = value;
 
-    if (pa == s->phy_addr) {
-        if (op == 1) { /* write */
-            lan9118_phy_write(&s->mii, ra, data);
-        } else if (op == 2) { /* read */
-            uint16_t r = lan9118_phy_read(&s->mii, ra);
-            s->regs[FEC_MMFR / 4] = (value & ~(uint32_t)MMFR_DATA_MASK) | r;
-        }
-    } else {
-        /* No PHY at that address — return all-ones on read. */
-        if (op == 2) {
-            s->regs[FEC_MMFR / 4] = (value & ~(uint32_t)MMFR_DATA_MASK) | 0xFFFF;
-        }
+    /*
+     * We model a single PHY but respond on whichever address the driver
+     * queries — the Vestas BSP probes at PA=0 while the QEMU default
+     * was 1, causing the BSP to see "no PHY" and stop its MII polling.
+     * Treat phy_addr as the *advertised* address but still answer
+     * on others, so any board's probing pattern gets a useful response.
+     */
+    (void)pa; /* PHY address ignored — single embedded PHY answers all */
+
+    if (op == 1) { /* write */
+        lan9118_phy_write(&s->mii, ra, data);
+    } else if (op == 2) { /* read */
+        uint16_t r = lan9118_phy_read(&s->mii, ra);
+        s->regs[FEC_MMFR / 4] = (value & ~(uint32_t)MMFR_DATA_MASK) | r;
     }
 
     s->regs[FEC_EIR / 4] |= EIR_MII;
@@ -199,13 +201,26 @@ static uint64_t mpc5200_fec_read(void *opaque, hwaddr offset, unsigned size)
         return 0;
     }
 
+    uint32_t v;
     switch (offset) {
     case FEC_FEC_ID:
-        /* Real silicon returns a constant ID; value isn't used by drivers. */
-        return 0;
+        v = 0; /* Real silicon returns a constant ID; drivers ignore it. */
+        break;
     default:
-        return s->regs[idx];
+        v = s->regs[idx];
+        break;
     }
+
+    {
+        static unsigned log_count = 0;
+        if (log_count++ < 100) {
+            fprintf(stderr, "FEC R +0x%03x => 0x%08x\n",
+                    (unsigned)offset, v);
+            fflush(stderr);
+        }
+    }
+
+    return v;
 }
 
 static void mpc5200_fec_write(void *opaque, hwaddr offset,

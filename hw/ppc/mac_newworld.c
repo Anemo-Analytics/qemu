@@ -216,6 +216,35 @@ static void mpc5200_tick(void *opaque)
         }
     }
 
+    /*
+     * Per BSP investigation, the BSP populates per-task config struct
+     * pointers in BSS at these absolute addresses once cacheDmaMalloc'd:
+     *   0x008CFC00 -> TASK_FEC_TX config struct
+     *   0x008CFC04 -> TASK_FEC_RX config struct
+     * Polling these from the timer is a simple way to surface the
+     * pointers as soon as the BSP writes them, without instrumenting
+     * the entire RAM write path.
+     */
+    {
+        static uint32_t last_tx_cfg, last_rx_cfg;
+        uint32_t tx_cfg = ldl_be_phys(&address_space_memory, 0x008CFC00);
+        uint32_t rx_cfg = ldl_be_phys(&address_space_memory, 0x008CFC04);
+        if (tx_cfg != last_tx_cfg) {
+            fprintf(stderr,
+                    "BestComm: BSS[0x008CFC00] (FEC TX cfg) = 0x%08x\n",
+                    tx_cfg);
+            fflush(stderr);
+            last_tx_cfg = tx_cfg;
+        }
+        if (rx_cfg != last_rx_cfg) {
+            fprintf(stderr,
+                    "BestComm: BSS[0x008CFC04] (FEC RX cfg) = 0x%08x\n",
+                    rx_cfg);
+            fflush(stderr);
+            last_rx_cfg = rx_cfg;
+        }
+    }
+
     if (tick_count++ < 3) {
         fprintf(stderr, "MPC5200: tick #%d, ic_pending=1, ext_armed=%d\n",
                 tick_count, ext_armed);
@@ -352,6 +381,25 @@ static void mpc5200_mmio_write(void *opaque, hwaddr offset,
         for (int k = (int)size - 1; k >= 0 && (i + k) < 0x100; k--) {
             s->bestcomm[i + k] = v & 0xff;
             v >>= 8;
+        }
+        /*
+         * Surface task-control-register writes — these tell us which
+         * BestComm task slots the BSP enables. Per BSP investigation:
+         *   TCR[2] = MBAR+0x1220 = FEC TX, enable pattern 0xC2
+         *   TCR[3] = MBAR+0x1222 = FEC RX, enable pattern 0xC3
+         * TCR is 16-bit accessed via `sth`; the value lives in the
+         * upper byte of a 32-bit BE write or the low byte of a 1-byte
+         * write. Log raw to keep diagnostics simple.
+         */
+        if (offset >= 0x121C && offset < 0x123C && size <= 2) {
+            unsigned slot = (offset - 0x121C) / 2;
+            uint16_t tcr = (uint16_t)(value & 0xFFFF);
+            fprintf(stderr,
+                    "BestComm TCR[%u] write: offset=0x%03x sz=%u val=0x%04x"
+                    " %s\n",
+                    slot, (unsigned)offset, size, tcr,
+                    (tcr & 0xC0) ? "(enable bit set)" : "");
+            fflush(stderr);
         }
         return;
     }
