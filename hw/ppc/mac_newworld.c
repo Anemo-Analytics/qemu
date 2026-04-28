@@ -555,20 +555,39 @@ static void mpc5200_tick(void *opaque)
                     }
                     fprintf(stderr, "\n");
                 }
-                /* Also dump 16 words starting at *handle[5] (potential
-                 * BD ring start). */
-                if (w[5] >= 0xF0008000 && w[5] < 0xF000C000) {
-                    uint32_t bd_ring_addr = ldl_be_phys(
-                        &address_space_memory, w[5]);
+                /* TX: var_base = *handle[3] (Linux MOTbcommlib layout:
+                 *   +0x00 DRD, +0x04 fifo, +0x08 enable, +0x0C bd_base,
+                 *   +0x10 bd_last, +0x14 bd_start, +0x18 buffer_size).
+                 * Read bd_base from var-table and dump first 8 BDs. */
+                if (w[3] >= 0xF0008000 && w[3] < 0xF000C000) {
+                    uint32_t var_base = ldl_be_phys(&address_space_memory,
+                                                     w[3]);
                     fprintf(stderr,
-                            "    bd_ring? *handle[5]=0x%08x; dumping 16 u32 there:\n      ",
-                            bd_ring_addr);
-                    for (int i = 0; i < 16; i++) {
+                            "    TX var_base=*handle[3]=0x%08x; var-table:\n      ",
+                            var_base);
+                    for (int i = 0; i < 7; i++) {
                         uint32_t v = ldl_be_phys(&address_space_memory,
-                                                 bd_ring_addr + i * 4);
+                                                 var_base + i * 4);
                         fprintf(stderr, "%08x ", v);
                     }
                     fprintf(stderr, "\n");
+                    uint32_t bd_base = ldl_be_phys(&address_space_memory,
+                                                    var_base + 0x0C);
+                    uint32_t bd_last = ldl_be_phys(&address_space_memory,
+                                                    var_base + 0x10);
+                    if (bd_base >= 0xF0008000 && bd_base < 0xF000C000 &&
+                        bd_last >= bd_base && bd_last < 0xF000C000) {
+                        unsigned n = (bd_last - bd_base) / 8 + 1;
+                        fprintf(stderr,
+                                "    TX BD ring @0x%08x..0x%08x (%u BDs); first 8 BDs:\n      ",
+                                bd_base, bd_last, n);
+                        for (int i = 0; i < 16; i++) {
+                            uint32_t v = ldl_be_phys(
+                                &address_space_memory, bd_base + i * 4);
+                            fprintf(stderr, "%08x ", v);
+                        }
+                        fprintf(stderr, "\n");
+                    }
                 }
             }
             fflush(stderr);
@@ -603,6 +622,39 @@ static void mpc5200_tick(void *opaque)
                     uint32_t v = ldl_be_phys(&address_space_memory, w[7]);
                     fprintf(stderr,
                             "    *handle[7](0x%08x) = 0x%08x\n", w[7], v);
+                }
+                /* RX: var_base = *handle[3] (Linux MOTbcommlib RX layout:
+                 *   +0x00 enable, +0x04 fifo, +0x08 bd_base, +0x0C bd_last,
+                 *   +0x10 bd_start, +0x14 buffer_size). */
+                if (w[3] >= 0xF0008000 && w[3] < 0xF000C000) {
+                    uint32_t var_base = ldl_be_phys(&address_space_memory,
+                                                     w[3]);
+                    fprintf(stderr,
+                            "    RX var_base=*handle[3]=0x%08x; var-table:\n      ",
+                            var_base);
+                    for (int i = 0; i < 6; i++) {
+                        uint32_t v = ldl_be_phys(&address_space_memory,
+                                                 var_base + i * 4);
+                        fprintf(stderr, "%08x ", v);
+                    }
+                    fprintf(stderr, "\n");
+                    uint32_t bd_base = ldl_be_phys(&address_space_memory,
+                                                    var_base + 0x08);
+                    uint32_t bd_last = ldl_be_phys(&address_space_memory,
+                                                    var_base + 0x0C);
+                    if (bd_base >= 0xF0008000 && bd_base < 0xF000C000 &&
+                        bd_last >= bd_base && bd_last < 0xF000C000) {
+                        unsigned n = (bd_last - bd_base) / 8 + 1;
+                        fprintf(stderr,
+                                "    RX BD ring @0x%08x..0x%08x (%u BDs); first 8 BDs:\n      ",
+                                bd_base, bd_last, n);
+                        for (int i = 0; i < 16; i++) {
+                            uint32_t v = ldl_be_phys(
+                                &address_space_memory, bd_base + i * 4);
+                            fprintf(stderr, "%08x ", v);
+                        }
+                        fprintf(stderr, "\n");
+                    }
                 }
             }
             fflush(stderr);
