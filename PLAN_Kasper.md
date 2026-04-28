@@ -12,8 +12,8 @@
 
 - `docs/MPC5200_Users_Guide.pdf` — full 732-page MPC5200UG Rev 3.1
   (03/2006). NXP source.
-- `docs/MPC5200_FEC_Chapter14.pdf` — Chapter 14 only, ~56 pages.
-- `docs/MPC5200_BestComm_Chapter13.pdf` — Chapter 13 (SDMA/BestComm),
+- `docs/MPC5200_FEC_Chapter14.md` — Chapter 14 only, ~56 pages.
+- `docs/MPC5200_BestComm_Chapter13.md` — Chapter 13 (SDMA/BestComm),
   ~30 pages.
 
 ## Why this exists
@@ -212,7 +212,7 @@ hypothesis. Pivot using Daniele's findings.
 
 1. **Register layout differs from i.MX6 in non-obvious ways** —
    ~~Need MPC5200 FEC manual~~. **Resolved:** manual is now in
-   `docs/MPC5200_FEC_Chapter14.pdf`. Read it before coding the BD
+   `docs/MPC5200_FEC_Chapter14.md`. Read it before coding the BD
    walker.
 
 2. ~~**BestComm DMA dependency may exist**~~ — **Confirmed by

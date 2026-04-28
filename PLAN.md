@@ -137,8 +137,8 @@ this is the fix.
 ## Reference docs (in repo)
 
 - `docs/MPC5200_Users_Guide.pdf` — full 732-page MPC5200UG Rev 3.1
-- `docs/MPC5200_FEC_Chapter14.pdf` — Fast Ethernet Controller (Ch 14)
-- `docs/MPC5200_BestComm_Chapter13.pdf` — SDMA / BestComm (Ch 13)
+- `docs/MPC5200_FEC_Chapter14.md` — Fast Ethernet Controller (Ch 14)
+- `docs/MPC5200_BestComm_Chapter13.md` — SDMA / BestComm (Ch 13)
 
 Key finding from page 14-1: **the FEC depends on BestComm DMA for all
 data transfer** ("Interrupt driven data movement from the processor is
