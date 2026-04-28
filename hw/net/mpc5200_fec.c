@@ -219,6 +219,15 @@ static void mpc5200_fec_write(void *opaque, hwaddr offset,
         return;
     }
 
+    {
+        static unsigned log_count = 0;
+        if (log_count++ < 100) {
+            fprintf(stderr, "FEC W +0x%03x = 0x%08x (sz=%u)\n",
+                    (unsigned)offset, v, size);
+            fflush(stderr);
+        }
+    }
+
     switch (offset) {
     case FEC_EIR:
         /* EIR bits are W1C — write-1-to-clear. */
