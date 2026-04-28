@@ -23,8 +23,8 @@ verifies.
 | **0** | QEMU builds, kernel loads | `vxworks.out` loaded at `0x100000`, CPU executes | `ninja -C build qemu-system-ppc` succeeds; kernel runs | ✅ |
 | **1** | Stable scheduler, no exception loops | `-d int` shows only `DECR`/`EXTERNAL`, never `HV_EMU` or `PROGRAM` | `grep -oE "=> [A-Z_]+" /tmp/qemu_int.txt \| sort \| uniq -c` | ✅ |
 | **2** | BSP reaches FEC init | FEC register writes show up — ECR reset, MAC programmed, MII clock divider, MII frame issued | grep `^FEC W` in QEMU log | ✅ (this session) |
-| **3** | BestComm executor — TX | When BSP enables TCR[2]=0xC2, our executor walks the BD ring and `qemu_send_packet`s the frame | Wireshark/tcpdump on host loopback shows guest-originated TCP SYN to 169.254.254.252:21 | 🟡 NEXT |
-| **4** | BestComm executor — RX | FTP server's SYN-ACK reaches the kernel; BSP sees frame in RX BD ring | FTP server logs accept the connection from guest IP `.254` (not just QEMU's startup probe) | ⏳ |
+| **3** | BestComm executor — TX | When BSP enables TCR[2]=0xC2, our executor walks the BD ring and `qemu_send_packet`s the frame | Wireshark/tcpdump on host loopback shows guest-originated TCP SYN to 169.254.254.252:21 | ✅ TX walker works; ARP frame on wire |
+| **4** | BestComm executor — RX | FTP server's SYN-ACK reaches the kernel; BSP sees frame in RX BD ring | FTP server logs accept the connection from guest IP `.254` (not just QEMU's startup probe) | 🟡 implemented, awaits exercise |
 | **5** | FTP boot completes | Anonymous login OK, `ct6003/vxworks` retrieved fully | FTP log shows `RETR ct6003/vxworks` + transfer size = full file | ⏳ |
 | **6** | First serial banner | Kernel emits PSC TX after image is loaded into RAM and runmode entered | `PSC_TX[…]: …` log lines appear for ASCII printable text | ⏳ |
 | **7** | Filesystem available | `/ata0a/` mounts, `etc/startup.app` found | grep for `dosFsDevInit` success / `iosDevShow` output via monitor | ⏳ |
@@ -121,6 +121,21 @@ the toolkit to be satisfied.
 
 Append-only. New entries at the top. One line per decision.
 
+- **2026-04-28** — **Gate 3 SUBSTANTIALLY DONE.** TX BD walker is
+  fully working: BSP's gratuitous ARP frame for `169.254.254.254` hits
+  the host network (verified via `tcpdump` on filter-dump pcap):
+  `ARP, Request who-has 169.254.254.254 tell 169.254.254.254`. The TX
+  walker reads TaskBAR from the bestcomm register file, follows
+  `TDT[2].var → 0xf0008700` (FEC TX var-table in SRAM), reads
+  bd_base/bd_last/bd_start, walks the 8-byte BDs, copies the 60-byte
+  payload from `skb_pa=0x07c06680` (DRAM), calls `qemu_send_packet`,
+  clears READY, advances cursor, fires EIR.TXF. Vestas BSP uses
+  unmodified Linux MOTbcommlib var-table layout (verified via SRAM
+  write trace). RX walker is implemented (hook into FEC `.receive`
+  callback) but not yet exercised — slirp doesn't respond to gratuitous
+  ARP (correct behavior). Open question: BSP doesn't retry / doesn't
+  progress past 1st ARP. Hypothesis: SDMA task-done IRQ at vec 0x27
+  (PerStat encoding TBD) needs to fire. See `BIG_PICTURE_2026-04-28.md`.
 - **2026-04-28** — **Gate 3 hardware unblocked.** Single-line fix:
   `mpc5200->cpu->env.spr[SPR_MBAR] = 0xF0000000` in mac_newworld_init
   (and re-applied in SLT tick handler in case CPU reset clobbers).
