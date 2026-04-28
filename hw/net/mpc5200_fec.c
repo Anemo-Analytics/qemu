@@ -230,7 +230,7 @@ static void mpc5200_fec_mmfr_write(MPC5200FECState *s, uint32_t value)
             case 0: /* BMCR: store full value, including ISOLATE/PDOWN/etc */
                 if (data & 0x8000) {
                     /* RESET (bit 15) self-clears: re-init to defaults */
-                    s->phy_bmcr = 0x3101;
+                    s->phy_bmcr = 0x3100;
                 } else {
                     s->phy_bmcr = data;
                 }
@@ -439,7 +439,7 @@ static void mpc5200_fec_reset_hold(Object *obj, ResetType type)
      *   BMSR = 0x782D  bits 14:11 capabilities + bit 5 AN_COMPLETE
      *                  + bit 3 AUTONEG + bit 2 LINK_ST + bit 0 EXTCAP
      */
-    s->phy_bmcr = 0x3101;
+    s->phy_bmcr = 0x3100;
     s->phy_bmsr = 0x782D;
 
     mpc5200_fec_update_irq(s);
