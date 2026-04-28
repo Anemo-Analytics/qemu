@@ -76,6 +76,16 @@
 #include "system/reset.h"
 #include "kvm_ppc.h"
 #include "hw/usb.h"
+#include "hw/net/mpc5200_bestcomm.h"
+#include "system/dma.h"
+
+/* Forward declarations from hw/net/mpc5200_fec.c */
+void mpc5200_fec_raise_eir(DeviceState *dev, uint32_t bits);
+void mpc5200_fec_send_packet(DeviceState *dev, const uint8_t *buf, size_t len);
+
+/* EIR.TXF bit — match the FEC device's macro. */
+#define MPC5200_FEC_EIR_TXF  (1U << 27)
+#define MPC5200_FEC_EIR_RXF  (1U << 25)
 #include "hw/sysbus.h"
 #include "trace.h"
 
@@ -149,6 +159,7 @@ typedef struct {
     QEMUTimer       *timer;
     QEMUTimer       *diag_timer;     /* fast NIP/MSR/DEC sampler */
     PowerPCCPU      *cpu;
+    DeviceState     *fec;            /* mpc5200-fec, for executor callbacks */
     bool             ic_pending;     /* legacy: SLT1 timer pending */
     bool             ic_fec_pending; /* FEC peripheral interrupt pending */
     MPC5200I2CState  i2c2;
@@ -439,6 +450,28 @@ static void mpc5200_tick(void *opaque)
             fprintf(stderr,
                     "BestComm: BSS[0x008CFC00] (FEC TX cfg) = 0x%08x\n",
                     tx_cfg);
+            if (tx_cfg) {
+                /* Dump first 32 bytes of TX var-table:
+                 * +0x00 DRD ptr, +0x04 fifo (TFIFO), +0x08 enable (TCR addr),
+                 * +0x0C bd_base, +0x10 bd_last, +0x14 bd_start,
+                 * +0x18 buffer_size */
+                uint8_t buf[32];
+                cpu_physical_memory_read(tx_cfg, buf, sizeof(buf));
+                fprintf(stderr, "  TX var-table @ 0x%08x:", tx_cfg);
+                for (unsigned k = 0; k < 32; k++) {
+                    if (k % 4 == 0) fprintf(stderr, " ");
+                    fprintf(stderr, "%02x", buf[k]);
+                }
+                fprintf(stderr, "\n");
+                /* Decode key fields (BE) */
+                uint32_t bd_base  = ldl_be_phys(&address_space_memory, tx_cfg + 0x0C);
+                uint32_t bd_last  = ldl_be_phys(&address_space_memory, tx_cfg + 0x10);
+                uint32_t bd_start = ldl_be_phys(&address_space_memory, tx_cfg + 0x14);
+                uint32_t bufsize  = ldl_be_phys(&address_space_memory, tx_cfg + 0x18);
+                fprintf(stderr,
+                        "  TX decoded: bd_base=0x%08x bd_last=0x%08x bd_start=0x%08x bufsize=%u\n",
+                        bd_base, bd_last, bd_start, bufsize);
+            }
             fflush(stderr);
             last_tx_cfg = tx_cfg;
         }
@@ -446,6 +479,25 @@ static void mpc5200_tick(void *opaque)
             fprintf(stderr,
                     "BestComm: BSS[0x008CFC04] (FEC RX cfg) = 0x%08x\n",
                     rx_cfg);
+            if (rx_cfg) {
+                uint8_t buf[32];
+                cpu_physical_memory_read(rx_cfg, buf, sizeof(buf));
+                fprintf(stderr, "  RX var-table @ 0x%08x:", rx_cfg);
+                for (unsigned k = 0; k < 32; k++) {
+                    if (k % 4 == 0) fprintf(stderr, " ");
+                    fprintf(stderr, "%02x", buf[k]);
+                }
+                fprintf(stderr, "\n");
+                /* RX layout: +0x00 enable, +0x04 fifo, +0x08 bd_base,
+                 * +0x0C bd_last, +0x10 bd_start, +0x14 buffer_size */
+                uint32_t bd_base  = ldl_be_phys(&address_space_memory, rx_cfg + 0x08);
+                uint32_t bd_last  = ldl_be_phys(&address_space_memory, rx_cfg + 0x0C);
+                uint32_t bd_start = ldl_be_phys(&address_space_memory, rx_cfg + 0x10);
+                uint32_t bufsize  = ldl_be_phys(&address_space_memory, rx_cfg + 0x14);
+                fprintf(stderr,
+                        "  RX decoded: bd_base=0x%08x bd_last=0x%08x bd_start=0x%08x bufsize=%u\n",
+                        bd_base, bd_last, bd_start, bufsize);
+            }
             fflush(stderr);
             last_rx_cfg = rx_cfg;
         }
@@ -632,6 +684,131 @@ static uint64_t mpc5200_mmio_read(void *opaque, hwaddr offset, unsigned size)
     return 0;
 }
 
+/*
+ * BestComm TX BD-walker (executor stub for FEC slot 2).
+ *
+ * Triggered when the BSP writes a non-zero value to TCR[2] @ MBAR+0x1220.
+ * Reads the var-table address from BSS@0x008CFC00 (populated by the BSP
+ * via cacheDmaMalloc). Walks the BD ring (8-byte stride, big-endian),
+ * `dma_memory_read`s each READY=1 BD's payload, and `qemu_send_packet`s
+ * it. Clears READY, advances cursor, repeats until a non-READY BD or
+ * we run out. Fires EIR.TXF on the FEC.
+ *
+ * BD format per BSP_motbcommlib_layout.md:
+ *   u32 status;   // BCOM_BD_READY @ bit 30 (mask 0x40000000)
+ *                 // BCOM_FEC_TX_BD_TFD @ bit 27 (last-in-frame marker)
+ *                 // length in low 11 bits
+ *   u32 skb_pa;   // physical address of payload buffer
+ */
+static void mpc5200_bestcomm_walk_tx(MPC5200State *s)
+{
+    uint32_t var = ldl_be_phys(&address_space_memory, BCOM_BSS_TX_VAR_PTR);
+    if (var == 0) {
+        fprintf(stderr,
+                "BestComm TX: TCR[2] enabled but BSS[0x008CFC00] is NULL\n");
+        fflush(stderr);
+        return;
+    }
+
+    uint32_t bd_base  = ldl_be_phys(&address_space_memory,
+                                    var + BCOM_FEC_TX_VAR_BD_BASE);
+    uint32_t bd_last  = ldl_be_phys(&address_space_memory,
+                                    var + BCOM_FEC_TX_VAR_BD_LAST);
+    uint32_t bd_start = ldl_be_phys(&address_space_memory,
+                                    var + BCOM_FEC_TX_VAR_BD_START);
+
+    fprintf(stderr,
+            "BestComm TX: walk var=0x%08x bd_base=0x%08x bd_last=0x%08x "
+            "bd_start=0x%08x\n",
+            var, bd_base, bd_last, bd_start);
+    fflush(stderr);
+
+    if (!bd_base || !bd_last || bd_start < bd_base || bd_start > bd_last) {
+        fprintf(stderr, "BestComm TX: BD ring fields look bogus, abort walk\n");
+        fflush(stderr);
+        return;
+    }
+
+    /*
+     * Defensive cap: stop after ringsize iterations even if we keep
+     * finding READY BDs, in case our READY-clear write doesn't take
+     * (e.g. if dst is read-only because BSP zeroed BSS).
+     */
+    unsigned ringsize = (bd_last - bd_base) / BCOM_FEC_BD_STRIDE + 1;
+    unsigned cursor   = (bd_start - bd_base) / BCOM_FEC_BD_STRIDE;
+    unsigned walked   = 0;
+    unsigned sent     = 0;
+
+    /*
+     * For multi-fragment frames the BSP may chain BDs, signalling the
+     * last fragment with BCOM_FEC_TX_BD_TFD. We accumulate fragments
+     * into a frame buffer and emit on TFD.
+     */
+    uint8_t frame[2048];
+    unsigned frame_len = 0;
+
+    while (walked++ < ringsize) {
+        uint32_t bd_addr = bd_base + cursor * BCOM_FEC_BD_STRIDE;
+        uint32_t status  = ldl_be_phys(&address_space_memory, bd_addr);
+        uint32_t skb_pa  = ldl_be_phys(&address_space_memory, bd_addr + 4);
+
+        if (!(status & BCOM_BD_READY)) {
+            break;
+        }
+
+        unsigned len = status & 0x000007FF;  /* 11-bit length field */
+
+        fprintf(stderr,
+                "BestComm TX:   BD[%u] @0x%08x status=0x%08x skb_pa=0x%08x len=%u%s\n",
+                cursor, bd_addr, status, skb_pa, len,
+                (status & BCOM_FEC_TX_BD_TFD) ? " TFD" : "");
+        fflush(stderr);
+
+        if (len && skb_pa && (frame_len + len) <= sizeof(frame)) {
+            cpu_physical_memory_read(skb_pa, frame + frame_len, len);
+            frame_len += len;
+        }
+
+        if (status & BCOM_FEC_TX_BD_TFD) {
+            if (frame_len >= 14 && s->fec) {
+                fprintf(stderr,
+                        "BestComm TX:   sending frame, len=%u\n", frame_len);
+                fflush(stderr);
+                mpc5200_fec_send_packet(s->fec, frame, frame_len);
+                sent++;
+            }
+            frame_len = 0;
+        }
+
+        /* Clear READY (CPU re-owns this BD). Preserve other status bits. */
+        stl_be_phys(&address_space_memory, bd_addr, status & ~BCOM_BD_READY);
+
+        if (bd_addr == bd_last) {
+            cursor = 0;
+        } else {
+            cursor++;
+        }
+    }
+
+    /* Update bd_start cursor in var-table so next walk picks up where we
+     * left off. */
+    {
+        uint32_t new_start = bd_base + cursor * BCOM_FEC_BD_STRIDE;
+        if (new_start > bd_last) {
+            new_start = bd_base;
+        }
+        stl_be_phys(&address_space_memory,
+                    var + BCOM_FEC_TX_VAR_BD_START, new_start);
+    }
+
+    if (sent && s->fec) {
+        mpc5200_fec_raise_eir(s->fec, MPC5200_FEC_EIR_TXF);
+    }
+
+    fprintf(stderr, "BestComm TX: walk done, frames sent=%u\n", sent);
+    fflush(stderr);
+}
+
 static void mpc5200_mmio_write(void *opaque, hwaddr offset,
                                uint64_t value, unsigned size)
 {
@@ -674,6 +851,14 @@ static void mpc5200_mmio_write(void *opaque, hwaddr offset,
                     "*** BestComm TCR[%u] WRITE: val=0x%04x %s ***\n",
                     slot, tcr, (tcr & 0xC0) ? "(ENABLE)" : "");
             fflush(stderr);
+            /* Trigger the BD-ring walker for the FEC TX (slot 2)
+             * task whenever a non-zero value is written. The Vestas
+             * BSP enables the task with `0x00C2` (AutoStart|HighEn|
+             * AS=2) — kicking on any non-zero write covers both the
+             * Linux-style EN bit and the BSP's AutoStart/AS pattern. */
+            if (slot == 2 && tcr != 0) {
+                mpc5200_bestcomm_walk_tx(s);
+            }
         }
         return;
     }
@@ -1283,6 +1468,7 @@ static void ppc_core99_init(MachineState *machine)
         sysbus_connect_irq(SYS_BUS_DEVICE(fec), 0,
                            qemu_allocate_irq(mpc5200_fec_irq_handler,
                                              mpc5200, 0));
+        mpc5200->fec = fec;
     }
 
     /* MPC5200 internal SRAM at 0x601f8000 (64 KiB) */

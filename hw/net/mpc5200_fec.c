@@ -175,6 +175,29 @@ static void mpc5200_fec_update_irq(MPC5200FECState *s)
 }
 
 /*
+ * Public helper for the BestComm executor stub in mac_newworld.c.
+ * Lets external code OR bits into EIR (TXF, RXF, etc.) and
+ * re-evaluate the IRQ line in one call.
+ */
+void mpc5200_fec_raise_eir(DeviceState *dev, uint32_t bits);
+void mpc5200_fec_raise_eir(DeviceState *dev, uint32_t bits)
+{
+    MPC5200FECState *s = MPC5200_FEC(dev);
+    s->regs[FEC_EIR / 4] |= bits;
+    mpc5200_fec_update_irq(s);
+}
+
+/* Same shape but lets the executor send a frame on the wire. */
+void mpc5200_fec_send_packet(DeviceState *dev, const uint8_t *buf, size_t len);
+void mpc5200_fec_send_packet(DeviceState *dev, const uint8_t *buf, size_t len)
+{
+    MPC5200FECState *s = MPC5200_FEC(dev);
+    if (s->nic && qemu_get_queue(s->nic)) {
+        qemu_send_packet(qemu_get_queue(s->nic), buf, len);
+    }
+}
+
+/*
  * MII Management Frame: writing MMFR triggers a PHY transaction.
  *   ST(2) | OP(2) | PA(5) | RA(5) | TA(2) | DATA(16)
  * OP = 01 = write, OP = 10 = read.
