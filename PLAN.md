@@ -34,14 +34,24 @@ verifies.
 | **11** | Toolkit reads parameters | Toolkit reads a parameter (e.g. RatedPower) and gets a plausible value | Toolkit UI shows non-zero value, not "comm error" | ⏳ |
 | **12** | **Toolkit performs software load** | Toolkit pushes a firmware/binary file via Firedrake/AP and the turbine accepts it | Toolkit UI shows "load successful" + QEMU logs the FTP/Firedrake receive | ⏳ **END GOAL** |
 
-### Where we are: gate **2 just cleared, working on 3.**
+### Where we are: gate **3 cleared (TX walker proven), gate 4 implemented and partly verified.**
 
-That's about **25% along the bar to gate 12.** Gates 3–6 are
-mechanical (~1–2 weeks). Gates 7–9 are scoping unknowns (days each
-once the path is clear). Gates 10–12 are the **long pole** —
-weeks to months because we have to reverse-engineer enough of
-Vestas-proprietary protocols (AP, Firecrest, Firedrake, NEON) for
-the toolkit to be satisfied.
+That's about **30-35% along the bar to gate 12.** Gates 5–6 are
+mechanical (~half-day each once BSP boot proceeds past the IP probe).
+Gates 7–9 are scoping unknowns (days each once the path is clear).
+Gates 10–12 are the **long pole** — weeks to months because we have
+to reverse-engineer enough of Vestas-proprietary protocols (AP,
+Firecrest, Firedrake, NEON) for the toolkit to be satisfied.
+
+**Concrete proof of gate 3:** the BSP's gratuitous ARP for IP
+`169.254.254.254` reaches the host via `qemu_send_packet`, captured
+in pcap and decoded by `tcpdump`:
+
+```
+ARP, Request who-has 169.254.254.254 tell 169.254.254.254, length 46
+```
+
+See `BIG_PICTURE_2026-04-28.md` for full evidence + `BSP_sram_layout_findings.md` for the SRAM/TDT/var-table chain.
 
 ### What's CONFIRMED vs HYPOTHETICAL right now
 
@@ -212,9 +222,12 @@ What to read in order, after a week away:
 
 1. **`PLAN.md`** (this file) — current gate position + decisions log
 2. **Most recent findings doc** — raw evidence for current state
-   - Latest: `BSP_bootrom_scheduler_findings.md` (bootrom scheduler wedge pinpointed; bootrom path dropped)
+   - Top of stack: `SESSION_LOG_2026-04-28.md` (comprehensive day chronology)
+   - Top of stack: `BIG_PICTURE_2026-04-28.md` (end-of-day snapshot)
+   - **Definitive SRAM reference:** `BSP_sram_layout_findings.md` (TaskBAR / TDT / var-table / BD layout — the "what runs where" map)
+   - Prior: `BSP_bootrom_scheduler_findings.md` (bootrom path dropped)
    - Prior: `BSP_comparison_study.md` (vxworks.out vs bootrom DEC mystery resolved)
-   - Prior: `BSP_fec_bestcomm_findings.md` (gate-3 wiring intel)
+   - Prior: `BSP_fec_bestcomm_findings.md` (gate-3 wiring intel — now superseded by `BSP_sram_layout_findings.md`)
 3. **Whichever per-person plan is active** — current work checklist
    - Active: `PLAN_Kasper.md` (steps 1,2,4,5,6 done; step 3 in progress)
    - Retired: `PLAN_Daniele.md` (his work is done)
