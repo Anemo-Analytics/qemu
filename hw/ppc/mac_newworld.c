@@ -442,64 +442,58 @@ static void mpc5200_tick(void *opaque)
      * pointers as soon as the BSP writes them, without instrumenting
      * the entire RAM write path.
      */
+    /*
+     * The pointers stored at BSS[0x008CFC00]/[0x008CFC04] are NOT
+     * var-tables — they are MOTbcommlib `bcom_task` heap-handles
+     * (32-byte wrappers). Only fields [0]=slot, [6]=initiator,
+     * [7]=bd_size are reliably populated at this point. The middle
+     * 5 fields look like residual heap data (virt pointers into
+     * TLB-handler code from a prior slab user). The real var-table
+     * lives in BestComm SRAM, pointed to by tdt[N].var. See
+     * BSP_var_table_findings.md (agent investigation 2026-04-28).
+     */
     {
-        static uint32_t last_tx_cfg, last_rx_cfg;
-        uint32_t tx_cfg = ldl_be_phys(&address_space_memory, 0x008CFC00);
-        uint32_t rx_cfg = ldl_be_phys(&address_space_memory, 0x008CFC04);
-        if (tx_cfg != last_tx_cfg) {
+        static uint32_t last_tx_handle, last_rx_handle;
+        uint32_t tx_handle = ldl_be_phys(&address_space_memory,
+                                         BCOM_BSS_TX_TASK_PTR);
+        uint32_t rx_handle = ldl_be_phys(&address_space_memory,
+                                         BCOM_BSS_RX_TASK_PTR);
+        if (tx_handle != last_tx_handle) {
             fprintf(stderr,
-                    "BestComm: BSS[0x008CFC00] (FEC TX cfg) = 0x%08x\n",
-                    tx_cfg);
-            if (tx_cfg) {
-                /* Dump first 32 bytes of TX var-table:
-                 * +0x00 DRD ptr, +0x04 fifo (TFIFO), +0x08 enable (TCR addr),
-                 * +0x0C bd_base, +0x10 bd_last, +0x14 bd_start,
-                 * +0x18 buffer_size */
-                uint8_t buf[32];
-                cpu_physical_memory_read(tx_cfg, buf, sizeof(buf));
-                fprintf(stderr, "  TX var-table @ 0x%08x:", tx_cfg);
-                for (unsigned k = 0; k < 32; k++) {
-                    if (k % 4 == 0) fprintf(stderr, " ");
-                    fprintf(stderr, "%02x", buf[k]);
-                }
-                fprintf(stderr, "\n");
-                /* Decode key fields (BE) */
-                uint32_t bd_base  = ldl_be_phys(&address_space_memory, tx_cfg + 0x0C);
-                uint32_t bd_last  = ldl_be_phys(&address_space_memory, tx_cfg + 0x10);
-                uint32_t bd_start = ldl_be_phys(&address_space_memory, tx_cfg + 0x14);
-                uint32_t bufsize  = ldl_be_phys(&address_space_memory, tx_cfg + 0x18);
+                    "BestComm: BSS[0x008CFC00] (FEC TX task handle) = 0x%08x\n",
+                    tx_handle);
+            if (tx_handle) {
+                uint32_t slot = ldl_be_phys(&address_space_memory,
+                                            tx_handle + BCOM_TASK_HANDLE_SLOT);
+                uint32_t init = ldl_be_phys(&address_space_memory,
+                                            tx_handle + BCOM_TASK_HANDLE_INITIATOR);
+                uint32_t bdsz = ldl_be_phys(&address_space_memory,
+                                            tx_handle + BCOM_TASK_HANDLE_BD_SIZE);
                 fprintf(stderr,
-                        "  TX decoded: bd_base=0x%08x bd_last=0x%08x bd_start=0x%08x bufsize=%u\n",
-                        bd_base, bd_last, bd_start, bufsize);
+                        "  TX handle: slot=%u initiator=%u bd_size=%u "
+                        "(real var-table is in SRAM via TDT)\n",
+                        slot, init, bdsz);
             }
             fflush(stderr);
-            last_tx_cfg = tx_cfg;
+            last_tx_handle = tx_handle;
         }
-        if (rx_cfg != last_rx_cfg) {
+        if (rx_handle != last_rx_handle) {
             fprintf(stderr,
-                    "BestComm: BSS[0x008CFC04] (FEC RX cfg) = 0x%08x\n",
-                    rx_cfg);
-            if (rx_cfg) {
-                uint8_t buf[32];
-                cpu_physical_memory_read(rx_cfg, buf, sizeof(buf));
-                fprintf(stderr, "  RX var-table @ 0x%08x:", rx_cfg);
-                for (unsigned k = 0; k < 32; k++) {
-                    if (k % 4 == 0) fprintf(stderr, " ");
-                    fprintf(stderr, "%02x", buf[k]);
-                }
-                fprintf(stderr, "\n");
-                /* RX layout: +0x00 enable, +0x04 fifo, +0x08 bd_base,
-                 * +0x0C bd_last, +0x10 bd_start, +0x14 buffer_size */
-                uint32_t bd_base  = ldl_be_phys(&address_space_memory, rx_cfg + 0x08);
-                uint32_t bd_last  = ldl_be_phys(&address_space_memory, rx_cfg + 0x0C);
-                uint32_t bd_start = ldl_be_phys(&address_space_memory, rx_cfg + 0x10);
-                uint32_t bufsize  = ldl_be_phys(&address_space_memory, rx_cfg + 0x14);
+                    "BestComm: BSS[0x008CFC04] (FEC RX task handle) = 0x%08x\n",
+                    rx_handle);
+            if (rx_handle) {
+                uint32_t slot = ldl_be_phys(&address_space_memory,
+                                            rx_handle + BCOM_TASK_HANDLE_SLOT);
+                uint32_t init = ldl_be_phys(&address_space_memory,
+                                            rx_handle + BCOM_TASK_HANDLE_INITIATOR);
+                uint32_t bdsz = ldl_be_phys(&address_space_memory,
+                                            rx_handle + BCOM_TASK_HANDLE_BD_SIZE);
                 fprintf(stderr,
-                        "  RX decoded: bd_base=0x%08x bd_last=0x%08x bd_start=0x%08x bufsize=%u\n",
-                        bd_base, bd_last, bd_start, bufsize);
+                        "  RX handle: slot=%u initiator=%u bd_size=%u\n",
+                        slot, init, bdsz);
             }
             fflush(stderr);
-            last_rx_cfg = rx_cfg;
+            last_rx_handle = rx_handle;
         }
     }
 
@@ -685,14 +679,15 @@ static uint64_t mpc5200_mmio_read(void *opaque, hwaddr offset, unsigned size)
 }
 
 /*
- * BestComm TX BD-walker (executor stub for FEC slot 2).
+ * BestComm TX BD-walker stub (executor for FEC slot 2).
  *
- * Triggered when the BSP writes a non-zero value to TCR[2] @ MBAR+0x1220.
- * Reads the var-table address from BSS@0x008CFC00 (populated by the BSP
- * via cacheDmaMalloc). Walks the BD ring (8-byte stride, big-endian),
- * `dma_memory_read`s each READY=1 BD's payload, and `qemu_send_packet`s
- * it. Clears READY, advances cursor, repeats until a non-READY BD or
- * we run out. Fires EIR.TXF on the FEC.
+ * NOTE: this walker assumes BSS@0x008CFC00 reaches the var-table
+ * directly, but per BSP_var_table_findings.md (agent 2026-04-28) it
+ * actually reaches a MOTbcommlib task HANDLE wrapper whose pointer
+ * fields are HTAB-mapped virtual addresses, not physical. The real
+ * var-table lives in BestComm SRAM via TDT. This stub is kept as a
+ * placeholder; redesign needed once TCR[2] writes are observed and we
+ * can snoop the SRAM TDT to find the actual var-table.
  *
  * BD format per BSP_motbcommlib_layout.md:
  *   u32 status;   // BCOM_BD_READY @ bit 30 (mask 0x40000000)
@@ -702,7 +697,7 @@ static uint64_t mpc5200_mmio_read(void *opaque, hwaddr offset, unsigned size)
  */
 static void mpc5200_bestcomm_walk_tx(MPC5200State *s)
 {
-    uint32_t var = ldl_be_phys(&address_space_memory, BCOM_BSS_TX_VAR_PTR);
+    uint32_t var = ldl_be_phys(&address_space_memory, BCOM_BSS_TX_TASK_PTR);
     if (var == 0) {
         fprintf(stderr,
                 "BestComm TX: TCR[2] enabled but BSS[0x008CFC00] is NULL\n");
