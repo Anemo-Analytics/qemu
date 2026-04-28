@@ -211,11 +211,49 @@ static void mpc5200_fec_irq_handler(void *opaque, int n, int level)
     }
 }
 
+/*
+ * Patch the BSP's CT296 KeySwitch check so it always passes.
+ *
+ * Per BSP_post_phy_init_findings.md, m5200FecStart at 0x12d390 calls
+ * 0x112630 (CT296DioGetKeySwitch cache reader), compares to 0, and
+ * branches to the "simulate PHY init error" path if the cache shows
+ * "LOCAL". This BSP build uses FpgaCT296SimKeyGet which reads
+ * /fs/fpga_ct296_key.txt via fopen — we have no filesystem yet, so
+ * the cache stays in a state the BSP rejects, triggering an infinite
+ * m5200FecRestart loop.
+ *
+ * NOP out the conditional branch so the FEC always starts. Identical
+ * patch may be needed inside m5200FecRestart at 0x12ae60 (also a
+ * keyswitch check) — applied speculatively.
+ *
+ * The patches are applied once on the first SLT timer tick, by which
+ * time the loader has put the ELF into RAM but the BSP may not yet
+ * have hit the patch sites.
+ */
+static void mpc5200_apply_keyswitch_patches(void)
+{
+    /* m5200FecStart: beq cr7, 0x12d7e8 → nop */
+    static const uint8_t nop[4] = {0x60, 0x00, 0x00, 0x00};
+    cpu_physical_memory_write(0x0012d390, nop, 4);
+    /* m5200FecRestart: bne- cr7, 0x12aea0 → nop (per agent) */
+    cpu_physical_memory_write(0x0012ae60, nop, 4);
+    fprintf(stderr,
+            "MPC5200: applied CT296 KeySwitch bypass patches at 0x12d390 "
+            "and 0x12ae60\n");
+    fflush(stderr);
+}
+
 static void mpc5200_tick(void *opaque)
 {
     MPC5200State *s = opaque;
     static int  tick_count = 0;
     static bool ext_armed  = false;
+    static bool patches_applied = false;
+
+    if (!patches_applied) {
+        mpc5200_apply_keyswitch_patches();
+        patches_applied = true;
+    }
 
     if (!ext_armed) {
         uint32_t w = ldl_be_phys(&address_space_memory, 0x508);
