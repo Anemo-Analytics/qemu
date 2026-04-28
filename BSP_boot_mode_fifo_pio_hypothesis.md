@@ -1,6 +1,10 @@
 # Boot-mode FEC: PIO via FIFO mailbox, not BestComm DMA
 
-**Status:** HYPOTHESIS — being verified by background agents
+**Status: REFUTED** — see "Verification result" section at bottom.
+The hypothesis below is preserved for context, but the conclusion
+turned out to be wrong. The boot-mode kernel DOES use BestComm; the
+real question (still open) is why `m5200FecEndLoad` doesn't run in
+our QEMU trace.
 
 ## The hypothesis
 
@@ -152,3 +156,81 @@ before we commit to the FIFO-mailbox implementation.
   expectation of BestComm executor
 - `BSP_motbcommlib_layout.md` — BD format etc. (for runtime, not
   boot mode)
+
+---
+
+## Verification result (added 2026-04-28, after agents returned)
+
+### Agent 1 (FIFO-PIO hypothesis) — REFUTED
+
+**Direct disassembly search of `vxworks.out` plus an embedded bootrom
+ELF found inside its `.data` segment:**
+
+- 0 direct CPU loads/stores to FEC FIFO data registers
+  (`0x31A4`, `0x3184`) in either binary
+- 0 absolute-address constants `0xF00031A4` / `0xF0003184`
+- 0 `addis rX,0,0xF000` followed by load/store in `0x3000..0x3400`
+
+Where `0x31A4` and `0x3184` DO appear, in identical patterns in both
+binaries (runtime `0x12C85C`/`0x12C8E0` and bootrom `0x10E695C`/
+`0x10E69E0`), they are: the FIFO physical addresses being **written
+into a stack-resident task-init structure** and passed to
+`BCom_*TaskSetup` calls. The CPU never directly touches the FIFO;
+BestComm SDMA does.
+
+**Both `vxworks.out` and the embedded bootrom use the same
+BestComm-DMA-based `m5200FecEndLoad` driver.**
+
+`m5200FecPollSend` / `m5200FecPollReceive` exist (at `0x12B0E4` /
+`0x12AFA8`) but "polled" only means "no semaphore/task wait" — they
+still spin on **buffer descriptors** which BestComm SDMA fills, not
+on FIFO registers directly.
+
+### Agent 2 (TCR-write code paths) — verified
+
+8 static TCR-write instructions in the entire image, all reachable
+**only** through `m5200FecEndLoad → TaskSetup_FEC_TX/RX`. No
+alternative code path. Confirmed `sysSdmaInit` is at `0x1329d4`
+(matches our `0x132xxx` NIP cluster), called once from
+`sysHwInit`-style helper at `0x11d180`. `m5200FecEndLoad` confirmed at
+`0x12c184`. `m5200FecSdmaTaskInit` is inlined at `0x12c834` (not
+`0x12c5d0` as earlier agent said).
+
+### New finding: embedded bootrom ELF
+
+`vxworks.out` contains a **second VxWorks bootrom ELF embedded in
+`.data`** at file offset `0xbc2ad0`, ~2.2 MB, with `.text` at vaddr
+`0x01000000`. Strings: `/romfs/bootrom_chain_mmc.elf`. Extracted
+locally to `/tmp/bootrom_extracted.elf`.
+
+Both binaries share the same `m5200FecEndLoad` driver pattern.
+
+### Implication
+
+The "FIFO PIO" theory was wrong. The path to packet flow IS through
+BestComm. So our original plan — build a BestComm executor — is
+correct after all. We just hit it later.
+
+But the question we surfaced remains valid: **why does
+`m5200FecEndLoad` never execute in our QEMU trace?** Possibilities
+the agent listed:
+
+1. `muxDevLoad`/`endLoad` only runs after `usrNetBootConfig`
+   succeeds, which depends on earlier system services (NVRAM TLV,
+   key switch, etc.). The boot may be wedged earlier.
+2. If BestComm task images don't load (no SRAM-loaded microcode,
+   unmapped peripheral), `m5200FecSdmaTaskInit` returns failure,
+   `muxDevLoad` is never reached.
+3. There's another KeySwitch or similar gate we haven't found.
+
+### Updated next steps
+
+- We DO need a BestComm executor (this work isn't wasted)
+- We ALSO need to find why `m5200FecEndLoad` doesn't run — fixing
+  the executor alone won't help if the BSP never gets there
+- Two-track: (a) build BestComm executor (original plan continues),
+  (b) investigate what gates `m5200FecEndLoad` from running
+
+The `BSP_motbcommlib_layout.md` and `BSP_fec_bestcomm_findings.md`
+docs are NOT superseded after all — they describe what we'll need
+when we resume the executor work.
