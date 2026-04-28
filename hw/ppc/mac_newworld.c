@@ -454,23 +454,22 @@ static void mpc5200_mmio_write(void *opaque, hwaddr offset,
             s->bestcomm[i + k] = v & 0xff;
             v >>= 8;
         }
-        /*
-         * Surface task-control-register writes — these tell us which
-         * BestComm task slots the BSP enables. Per BSP investigation:
-         *   TCR[2] = MBAR+0x1220 = FEC TX, enable pattern 0xC2
-         *   TCR[3] = MBAR+0x1222 = FEC RX, enable pattern 0xC3
-         * TCR is 16-bit accessed via `sth`; the value lives in the
-         * upper byte of a 32-bit BE write or the low byte of a 1-byte
-         * write. Log raw to keep diagnostics simple.
-         */
+        /* Diagnostic: log all BestComm config writes (first ~64). */
+        {
+            static unsigned bc_log = 0;
+            if (bc_log++ < 64) {
+                fprintf(stderr,
+                        "BestComm W +0x%03x sz=%u val=0x%08x\n",
+                        (unsigned)offset, size, (unsigned)value);
+                fflush(stderr);
+            }
+        }
         if (offset >= 0x121C && offset < 0x123C && size <= 2) {
             unsigned slot = (offset - 0x121C) / 2;
             uint16_t tcr = (uint16_t)(value & 0xFFFF);
             fprintf(stderr,
-                    "BestComm TCR[%u] write: offset=0x%03x sz=%u val=0x%04x"
-                    " %s\n",
-                    slot, (unsigned)offset, size, tcr,
-                    (tcr & 0xC0) ? "(enable bit set)" : "");
+                    "*** BestComm TCR[%u] WRITE: val=0x%04x %s ***\n",
+                    slot, tcr, (tcr & 0xC0) ? "(ENABLE)" : "");
             fflush(stderr);
         }
         return;
@@ -1005,6 +1004,20 @@ static void ppc_core99_init(MachineState *machine)
     /* MPC5200 MBAR region: custom stub for IC, I2C2 (X1226), PSC, EEPROM */
     mpc5200->cpu = POWERPC_CPU(first_cpu);
     mpc5200_i2c2_init(&mpc5200->i2c2);
+
+    /*
+     * BestComm TaskBar Pointer (MBAR+0x1200) hardware reset value is
+     * 0xFC003000 — points at SRAM where SDMA task descriptors live.
+     * Per BSP investigation (agent post-PHY-init trace):
+     * `m5200FecEndLoad` reads MBAR+0x1200 early; if it sees 0 it
+     * silently exits before reaching `m5200FecSdmaTaskInit`. Initialise
+     * the bestcomm[] backing buffer with the reset value at offset 0
+     * so the BSP's first read returns sane data.
+     */
+    mpc5200->bestcomm[0x00] = 0xFC;
+    mpc5200->bestcomm[0x01] = 0x00;
+    mpc5200->bestcomm[0x02] = 0x30;
+    mpc5200->bestcomm[0x03] = 0x00;
     mpc5200->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, mpc5200_tick, mpc5200);
     /* delay first tick by 1 s of guest time to let BSP run early init */
     {
