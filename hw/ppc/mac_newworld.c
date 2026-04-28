@@ -322,6 +322,25 @@ static BootStation g_boot_stations[] = {
     { 0x0011aae0, 0x0011aaff, "VX: sysClkEnable",                       false, 0 },
     { 0x00207a18, 0x00207a1f, "VX: vxDecSet -- DEC ARMED (runtime)",    false, 0 },
     { 0x00117fd0, 0x001180ff, "VX: sysClkInt",                          false, 0 },
+
+    /* Real PHY init body & probe (per agent investigation) */
+    { 0x0012f084, 0x0012f12b, "VX: m5200FecMiiProbe (real)",            false, 0 },
+    { 0x0012f12c, 0x0012ffff, "VX: m5200FecPhyInit (real)",             false, 0 },
+    { 0x0012ec90, 0x0012edf3, "VX: m5200FecMiiBasicCheck (real)",       false, 0 },
+    { 0x0012ef84, 0x0012f083, "VX: m5200FecMiiIsolate (real)",          false, 0 },
+    { 0x0012ec3c, 0x0012ec8f, "VX: m5200FecMiiRead",                    false, 0 },
+    { 0x0012ebbc, 0x0012ec3b, "VX: m5200FecMiiWrite",                   false, 0 },
+    /* === vxworks.out FEC EndLoad gap (gate 3 blocker) === */
+    { 0x0012be9c, 0x0012bf6c, "VX: m5200FecMiiProbe",                   false, 0 },
+    { 0x0012c184, 0x0012c8bb, "VX: m5200FecEndLoad body",               false, 0 },
+    { 0x0012c8bc, 0x0012c8c7, "VX: EndLoad ERROR path entry",           false, 0 },
+    { 0x0012c8c8, 0x0012c91f, "VX: EndLoad post-TX-success (RX setup)", false, 0 },
+    { 0x0020bbd8, 0x0020bccf, "VX: SDMA TX setup (pre-TCR write)",      false, 0 },
+    { 0x0020bcd0, 0x0020bcd3, "VX: TCR[2] WRITE (sth at 4636(r8))",     false, 0 },
+    { 0x0020bcd4, 0x0020bdff, "VX: SDMA TX setup post-TCR",             false, 0 },
+    { 0x0020b9fc, 0x0020bbd7, "VX: SDMA RX setup body",                 false, 0 },
+    { 0x0020b848, 0x0020b9fb, "VX: SDMA common installer",              false, 0 },
+    { 0x0020a3b0, 0x0020a5f7, "VX: init_dma_image_TASK_FEC_TX",         false, 0 },
 };
 
 /* NIP histogram across full bootrom .text — reveals idle loops. */
@@ -359,6 +378,39 @@ static void mpc5200_diag_sample(void *opaque)
         unsigned idx = (nip - NIP_HIST_BASE) / 4;
         if (g_nip_hist[idx] < UINT_MAX) {
             g_nip_hist[idx]++;
+        }
+    }
+
+    /* Re-apply MBAR SPR if it got cleared by CPU reset. */
+    if (s->cpu->env.spr[SPR_MBAR] != 0xF0000000) {
+        s->cpu->env.spr[SPR_MBAR] = 0xF0000000;
+    }
+
+    /* Debug: dump SPR_MBAR + *(0x908918) + *(0x90851C) once they become non-zero —
+     * these are the MBAR-base / SDMA-base BSS variables used by
+     * TaskSetup_TASK_FEC_TX (`sth r4, 4636(r8)` at 0x20bcd0 derives the
+     * TCR address from these). Per agent investigation 2026-04-28. */
+    {
+        static uint32_t last_mbar_base, last_sdma_base, last_spr_mbar;
+        uint32_t mbar_base = ldl_be_phys(&address_space_memory, 0x908918);
+        uint32_t sdma_base = ldl_be_phys(&address_space_memory, 0x90851C);
+        uint32_t spr_mbar  = (uint32_t)s->cpu->env.spr[SPR_MBAR];
+        if (spr_mbar != last_spr_mbar) {
+            fprintf(stderr, "BSP: SPR_MBAR = 0x%08x\n", spr_mbar);
+            fflush(stderr);
+            last_spr_mbar = spr_mbar;
+        }
+        if (mbar_base != last_mbar_base) {
+            fprintf(stderr,
+                    "BSP: *(0x908918) (MBAR base?) = 0x%08x\n", mbar_base);
+            fflush(stderr);
+            last_mbar_base = mbar_base;
+        }
+        if (sdma_base != last_sdma_base) {
+            fprintf(stderr,
+                    "BSP: *(0x90851C) (SDMA base?) = 0x%08x\n", sdma_base);
+            fflush(stderr);
+            last_sdma_base = sdma_base;
         }
     }
 
@@ -1413,6 +1465,18 @@ static void ppc_core99_init(MachineState *machine)
 
     /* MPC5200 MBAR region: custom stub for IC, I2C2 (X1226), PSC, EEPROM */
     mpc5200->cpu = POWERPC_CPU(first_cpu);
+
+    /*
+     * MPC5200 internal-peripheral base register (SPR 638 / MBAR) hardware
+     * reset value is 0xF0000000. QEMU's generic G2 init resets it to 0,
+     * which makes the BSP's vxMBarGet() return 0; downstream code (notably
+     * TaskSetup_TASK_FEC_TX) computes TCR addresses as MBAR + slot*2 +
+     * 0x121C and writes them to physical RAM at 0x1220 instead of MBAR.
+     * Force the proper reset value here. Also re-applied later in the
+     * SLT tick handler in case CPU reset clobbers it.
+     */
+    mpc5200->cpu->env.spr[SPR_MBAR] = 0xF0000000;
+
     mpc5200_i2c2_init(&mpc5200->i2c2);
 
     /*
