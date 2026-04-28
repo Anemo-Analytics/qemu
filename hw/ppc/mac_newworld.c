@@ -93,7 +93,8 @@
  *   [8:12]  size = 0x3c (60-byte data section)
  *   [12:72] 60 bytes data; byte 19 = board type 23 (CT6003_Motherboard_V3)
  */
-static const uint8_t mpc5200_eeprom[72] = {
+#define MPC5200_EEPROM_SIZE 512
+static const uint8_t mpc5200_eeprom_init[72] = {
     /* checksum */  0xb8, 0xe1, 0xde, 0x02,
     /* version  */  0x00, 0x00, 0x00, 0x04,
     /* size     */  0x00, 0x00, 0x00, 0x3c,
@@ -108,25 +109,64 @@ static const uint8_t mpc5200_eeprom[72] = {
                       0x00, 0x00, 0x00, 0x00,
 };
 
+/*
+ * Tiny X1226 (RTC + 512 B EEPROM) state machine on I2C2.
+ * X1226 wire protocol: 7-bit slave addr (0x6f for RTC regs, 0x57 for EEPROM
+ * user space) + 16-bit internal address. Master writes "[slave|W][hi][lo]"
+ * to set the address, then either continues with data bytes (write) or
+ * issues a repeated-start with [slave|R] and reads bytes back. The kernel's
+ * m5200i2c driver pokes MBCR/MBSR/MDR; we satisfy it by tracking the
+ * transaction phase and toggling MIF correctly.
+ */
+typedef enum {
+    I2C_IDLE = 0,
+    I2C_ADDR,    /* expecting slave-address byte after START */
+    I2C_REG_HI,  /* expecting hi byte of internal address (master TX) */
+    I2C_REG_LO,  /* expecting lo byte of internal address (master TX) */
+    I2C_DATA,    /* data phase, direction given by `reading` */
+} MPC5200I2CPhase;
+
 typedef struct {
-    MemoryRegion  mr;
-    QEMUTimer    *timer;
-    PowerPCCPU   *cpu;
-    bool          ic_pending;
-    unsigned int  i2c_byte;
+    MPC5200I2CPhase phase;
+    uint8_t  slave_addr;   /* 7-bit */
+    uint16_t reg_addr;     /* X1226 16-bit internal cursor */
+    bool     reading;      /* R/W bit from slave-address byte */
+    bool     mif;           /* interrupt flag, cleared on MBSR read */
+    bool     mcf;          /* transfer complete */
+    bool     mbb;          /* bus busy */
+    bool     rxak;         /* last receive acknowledge (0 = ACK from slave) */
+    uint8_t  mbcr;         /* last value written to MBCR (read-back support) */
+    uint8_t  madr;         /* last value written to MADR */
+    uint8_t  mfdr;         /* last value written to MFDR */
+    uint8_t  mdfsrr;       /* last value written to MDFSRR */
+    uint8_t  eeprom[MPC5200_EEPROM_SIZE];
+} MPC5200I2CState;
+
+typedef struct {
+    MemoryRegion     mr;
+    QEMUTimer       *timer;
+    PowerPCCPU      *cpu;
+    bool             ic_pending;
+    MPC5200I2CState  i2c2;
     /*
      * BestComm/SDMA register file (MBAR+0x1200..0x12FF). Modeled as plain
      * register storage: the BSP writes config values (TaskBar, task control
      * bytes, interrupt masks) and reads them back. We don't simulate any
      * actual DMA; tasks are no-ops as far as the BSP can tell.
      */
-    uint8_t       bestcomm[0x100];
+    uint8_t          bestcomm[0x100];
     /*
      * MPC5200 internal SRAM (MBAR+0x8000..0xFFFF, 32 KiB). BestComm stores
      * task descriptors here. The BSP reads/writes it as memory.
      */
-    uint8_t       sram[0x8000];
+    uint8_t          sram[0x8000];
 } MPC5200State;
+
+static void mpc5200_i2c2_init(MPC5200I2CState *i2c)
+{
+    memset(i2c, 0, sizeof(*i2c));
+    memcpy(i2c->eeprom, mpc5200_eeprom_init, sizeof(mpc5200_eeprom_init));
+}
 
 static void mpc5200_tick(void *opaque)
 {
@@ -188,15 +228,42 @@ static uint64_t mpc5200_mmio_read(void *opaque, hwaddr offset, unsigned size)
         }
         return v << (8 * (4 - size));
     }
-    /* I2C1 SR=0x3d0c, I2C2 SR=0x3d4c: MCF+MIF set = transfer complete */
-    if (offset == 0x3d0c || offset == 0x3d4c) {
+    /* I2C1 SR=0x3d0c: legacy stub (no chip behind it) — keep MCF+MIF set */
+    if (offset == 0x3d0c) {
         return 0x82000000;
     }
-    /* I2C2 data register: return next EEPROM byte */
-    if (offset == 0x3d50) {
-        uint8_t b = mpc5200_eeprom[s->i2c_byte % sizeof(mpc5200_eeprom)];
-        s->i2c_byte++;
-        return (uint64_t)b << 24; /* BE: byte in MSB position */
+    /* I2C2 (0x3d40..0x3d57): X1226 state machine + register read-back */
+    if (offset == 0x3d40) { return (uint64_t)s->i2c2.madr   << 24; }
+    if (offset == 0x3d44) { return (uint64_t)s->i2c2.mfdr   << 24; }
+    if (offset == 0x3d48) { return (uint64_t)s->i2c2.mbcr   << 24; }
+    if (offset == 0x3d54) { return (uint64_t)s->i2c2.mdfsrr << 24; }
+    if (offset == 0x3d4c) { /* MBSR */
+        MPC5200I2CState *i2c = &s->i2c2;
+        uint8_t sr = ((i2c->mcf  ? 1 : 0) << 7)
+                   | ((i2c->mbb  ? 1 : 0) << 5)
+                   | ((i2c->mif  ? 1 : 0) << 1)
+                   | ((i2c->rxak ? 1 : 0) << 0);
+        i2c->mif = false; /* read clears interrupt flag */
+        return (uint64_t)sr << 24;
+    }
+    if (offset == 0x3d50) { /* MDR — data read */
+        MPC5200I2CState *i2c = &s->i2c2;
+        uint8_t b = 0xff;
+        if (i2c->phase == I2C_DATA && i2c->reading) {
+            if (i2c->slave_addr == 0x50 ||
+                i2c->slave_addr == 0x57 ||
+                i2c->slave_addr == 0x6f) {
+                b = i2c->eeprom[i2c->reg_addr & (MPC5200_EEPROM_SIZE - 1)];
+                fprintf(stderr, "I2C2 RD slave=0x%02x reg=0x%03x -> 0x%02x\n",
+                        i2c->slave_addr, i2c->reg_addr, b);
+                fflush(stderr);
+                i2c->reg_addr++;
+            }
+            i2c->mcf = true;
+            i2c->mif = true;
+            i2c->rxak = false;
+        }
+        return (uint64_t)b << 24;
     }
     /*
      * PSC1-6 Status Registers (SR at PSCn_base+4):
@@ -248,10 +315,103 @@ static void mpc5200_mmio_write(void *opaque, hwaddr offset,
         }
         return;
     }
-    /* Reset EEPROM byte counter when BSP initiates a new I2C transfer */
-    if (offset == 0x3d48 && (value & 0x10000000)) { /* MBCR2 START bit */
-        s->i2c_byte = 0;
-        return;
+    /* I2C2 control / data writes (X1226 state machine) */
+    if (offset >= 0x3d40 && offset < 0x3d58) {
+        MPC5200I2CState *i2c = &s->i2c2;
+        /*
+         * MBCR is byte-accessed via 32-bit BE writes from VxWorks; bits we
+         * care about live in the high byte: MEN(7) MIEN(6) MSTA(5,START)
+         * MTX(4) TXAK(3) RSTA(2). Both 32-bit writes (value MSB) and 1-byte
+         * writes (value low byte) need handling.
+         */
+        uint8_t b = (size == 1) ? (value & 0xff) : ((value >> 24) & 0xff);
+        switch (offset) {
+        case 0x3d48: { /* MBCR */
+            i2c->mbcr = b;                   /* store for read-back */
+            bool start = (b >> 5) & 1;       /* MSTA */
+            bool restart = (b >> 2) & 1;     /* RSTA */
+            if (start && (!i2c->mbb || restart)) {
+                /* START or repeated-START: next MDR write is slave-addr byte */
+                fprintf(stderr, "I2C2 START%s\n", restart ? " (RSTA)" : "");
+                fflush(stderr);
+                i2c->phase = I2C_ADDR;
+                i2c->mbb = true;
+                i2c->mcf = false;
+                i2c->mif = false;
+                i2c->rxak = false;
+            } else if (!start && i2c->mbb) {
+                /* STOP */
+                fprintf(stderr, "I2C2 STOP\n"); fflush(stderr);
+                i2c->phase = I2C_IDLE;
+                i2c->mbb = false;
+                i2c->mcf = true;
+            }
+            return;
+        }
+        case 0x3d50: { /* MDR — master TX data byte */
+            switch (i2c->phase) {
+            case I2C_ADDR:
+                i2c->slave_addr = (b >> 1) & 0x7f;
+                i2c->reading = b & 1;
+                fprintf(stderr, "I2C2 ADDR slave=0x%02x %s\n",
+                        i2c->slave_addr, i2c->reading ? "RD" : "WR");
+                fflush(stderr);
+                /*
+                 * 0x50 = AT24Cxx-style board-id EEPROM (1-byte internal addr).
+                 * 0x57/0x6f = X1226 EEPROM/RTC (2-byte internal addr).
+                 * Everything else NACKs.
+                 */
+                if (i2c->slave_addr == 0x50) {
+                    i2c->rxak = false;
+                    if (i2c->reading) {
+                        i2c->phase = I2C_DATA;     /* repeated-start, addr already set */
+                    } else {
+                        i2c->phase = I2C_REG_LO;   /* 1-byte internal address */
+                    }
+                } else if (i2c->slave_addr == 0x57 || i2c->slave_addr == 0x6f) {
+                    i2c->rxak = false;
+                    if (i2c->reading) {
+                        i2c->phase = I2C_DATA;
+                    } else {
+                        i2c->phase = I2C_REG_HI;   /* 2-byte internal address */
+                    }
+                } else {
+                    i2c->rxak = true; /* NACK */
+                    i2c->phase = I2C_IDLE;
+                }
+                break;
+            case I2C_REG_HI:
+                i2c->reg_addr = (uint16_t)b << 8;
+                i2c->phase = I2C_REG_LO;
+                i2c->rxak = false;
+                break;
+            case I2C_REG_LO:
+                i2c->reg_addr |= b;
+                i2c->phase = I2C_DATA;
+                i2c->rxak = false;
+                break;
+            case I2C_DATA:
+                if (!i2c->reading &&
+                    (i2c->slave_addr == 0x57 || i2c->slave_addr == 0x6f)) {
+                    i2c->eeprom[i2c->reg_addr & (MPC5200_EEPROM_SIZE - 1)] = b;
+                    i2c->reg_addr++;
+                }
+                i2c->rxak = false;
+                break;
+            default:
+                i2c->rxak = true;
+                break;
+            }
+            i2c->mcf = true;
+            i2c->mif = true;
+            return;
+        }
+        case 0x3d40: i2c->madr   = b; return;
+        case 0x3d44: i2c->mfdr   = b; return;
+        case 0x3d54: i2c->mdfsrr = b; return;
+        default:
+            return;
+        }
     }
     /* PSC TX data: PSCn at MBAR+0x2000, TX buffer at PSCn+0x0c */
     if (offset >= 0x2000 && offset < 0x2c00) {
@@ -669,8 +829,9 @@ static void ppc_core99_init(MachineState *machine)
     sysbus_mmio_map(s, 0, CFG_ADDR);
     sysbus_mmio_map(s, 1, CFG_ADDR + 2);
 
-    /* MPC5200 MBAR region: custom stub returning plausible I2C status values */
+    /* MPC5200 MBAR region: custom stub for IC, I2C2 (X1226), PSC, EEPROM */
     mpc5200->cpu = POWERPC_CPU(first_cpu);
+    mpc5200_i2c2_init(&mpc5200->i2c2);
     mpc5200->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, mpc5200_tick, mpc5200);
     /* delay first tick by 1 s of guest time to let BSP install interrupt vectors */
     {
