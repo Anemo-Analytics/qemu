@@ -114,6 +114,18 @@ typedef struct {
     PowerPCCPU   *cpu;
     bool          ic_pending;
     unsigned int  i2c_byte;
+    /*
+     * BestComm/SDMA register file (MBAR+0x1200..0x12FF). Modeled as plain
+     * register storage: the BSP writes config values (TaskBar, task control
+     * bytes, interrupt masks) and reads them back. We don't simulate any
+     * actual DMA; tasks are no-ops as far as the BSP can tell.
+     */
+    uint8_t       bestcomm[0x100];
+    /*
+     * MPC5200 internal SRAM (MBAR+0x8000..0xFFFF, 32 KiB). BestComm stores
+     * task descriptors here. The BSP reads/writes it as memory.
+     */
+    uint8_t       sram[0x8000];
 } MPC5200State;
 
 static void mpc5200_tick(void *opaque)
@@ -158,6 +170,24 @@ static uint64_t mpc5200_mmio_read(void *opaque, hwaddr offset, unsigned size)
         return 0x40000000;
     }
 
+    /* BestComm/SDMA register file: byte-addressable RAM. Big-endian. */
+    if (offset >= 0x1200 && offset < 0x1300) {
+        unsigned i = offset - 0x1200;
+        uint64_t v = 0;
+        for (unsigned k = 0; k < size && (i + k) < 0x100; k++) {
+            v = (v << 8) | s->bestcomm[i + k];
+        }
+        return v << (8 * (4 - size)); /* MSB-align the result for BE */
+    }
+    /* MPC5200 internal SRAM (MBAR+0x8000..0xFFFF, 32 KiB) */
+    if (offset >= 0x8000 && offset < 0x10000) {
+        unsigned i = offset - 0x8000;
+        uint64_t v = 0;
+        for (unsigned k = 0; k < size && (i + k) < sizeof(s->sram); k++) {
+            v = (v << 8) | s->sram[i + k];
+        }
+        return v << (8 * (4 - size));
+    }
     /* I2C1 SR=0x3d0c, I2C2 SR=0x3d4c: MCF+MIF set = transfer complete */
     if (offset == 0x3d0c || offset == 0x3d4c) {
         return 0x82000000;
@@ -190,6 +220,32 @@ static void mpc5200_mmio_write(void *opaque, hwaddr offset,
     if (offset >= 0x0500 && offset <= 0x052c) {
         s->ic_pending = false;
         ppc_set_irq(s->cpu, PPC_INTERRUPT_EXT, 0);
+        return;
+    }
+    /* BestComm/SDMA register file: store as bytes (BE), match access size. */
+    if (offset >= 0x1200 && offset < 0x1300) {
+        unsigned i = offset - 0x1200;
+        uint64_t v = value;
+        if (size < 4) {
+            v &= ((uint64_t)1 << (8 * size)) - 1;
+        }
+        for (int k = (int)size - 1; k >= 0 && (i + k) < 0x100; k--) {
+            s->bestcomm[i + k] = v & 0xff;
+            v >>= 8;
+        }
+        return;
+    }
+    /* MPC5200 internal SRAM (MBAR+0x8000..0xFFFF, 32 KiB) */
+    if (offset >= 0x8000 && offset < 0x10000) {
+        unsigned i = offset - 0x8000;
+        uint64_t v = value;
+        if (size < 4) {
+            v &= ((uint64_t)1 << (8 * size)) - 1;
+        }
+        for (int k = (int)size - 1; k >= 0 && (i + k) < (int)sizeof(s->sram); k--) {
+            s->sram[i + k] = v & 0xff;
+            v >>= 8;
+        }
         return;
     }
     /* Reset EEPROM byte counter when BSP initiates a new I2C transfer */
