@@ -24,24 +24,42 @@ verifies.
 | **1** | Stable scheduler, no exception loops | `-d int` shows only `DECR`/`EXTERNAL`, never `HV_EMU` or `PROGRAM` | `grep -oE "=> [A-Z_]+" /tmp/qemu_int.txt \| sort \| uniq -c` | ✅ |
 | **2** | BSP reaches FEC init | FEC register writes show up — ECR reset, MAC programmed, MII clock divider, MII frame issued | grep `^FEC W` in QEMU log | ✅ (this session) |
 | **3** | BestComm executor — TX | When BSP enables TCR[2]=0xC2, our executor walks the BD ring and `qemu_send_packet`s the frame | Wireshark/tcpdump on host loopback shows guest-originated TCP SYN to 169.254.254.252:21 | ✅ TX walker works; ARP frame on wire |
-| **4** | BestComm executor — RX | FTP server's SYN-ACK reaches the kernel; BSP sees frame in RX BD ring | FTP server logs accept the connection from guest IP `.254` (not just QEMU's startup probe) | 🟡 implemented, awaits exercise |
-| **5** | FTP boot completes | Anonymous login OK, `ct6003/vxworks` retrieved fully | FTP log shows `RETR ct6003/vxworks` + transfer size = full file | ⏳ |
-| **6** | First serial banner | Kernel emits PSC TX after image is loaded into RAM and runmode entered | `PSC_TX[…]: …` log lines appear for ASCII printable text | ⏳ |
-| **7** | Filesystem available | `/ata0a/` mounts, `etc/startup.app` found | grep for `dosFsDevInit` success / `iosDevShow` output via monitor | ⏳ |
-| **8** | Application boots | `startup.app` runs, Vestas turbine application initializes | banner says `Wind World ...` or task list shows turbine app names (`tApMain`, `tFirecrest`, etc.) | ⏳ |
-| **9** | Network listener up | App opens AP / Firecrest / Firedrake ports | `nmap -p 8080,9482,...` from host shows listening ports | ⏳ |
+| **4** | BestComm executor — RX | Inbound frame's BD copy + EIR.RXF + SDMA RX IRQ delivered to BSP | host-injected frame → `BestComm RX:` log + `tFecEndRx` unblocks | 🟡 infra wired (RX walker, SDMA IRQ math, IntMask gating verified by code review). **NOT exercised** — slirp doesn't initiate traffic to the guest |
+| **5** | ~~FTP boot completes~~ | superseded — this BSP image doesn't *try* to FTP-boot from `.252` | n/a | ⚠️ **bypassed, not achieved.** BSP runs without an FS image being pulled. Whether it had a usable FS or not is unknown |
+| **6** | First serial banner | Vestas app emits banner on PSC | `PSC_TX[…]: Wind World ...` log line | ❌ **not achieved.** No PSC TX observed — Vestas app isn't running |
+| **7** | Filesystem available | `/ata0a/` mounted, `etc/startup.app` found | `iosDevShow` lists `/ata0a/` | ❓ **unverified.** Service daemons spawned ≠ FS mounted. We have zero direct evidence |
+| **8** | Vestas application boots | `startup.app` runs, `tApMain`/`tFirecrest`/`tFiredrake` appear | task list contains those names, banner emitted | ❌ **NOT achieved.** Task list contains 21 tasks — all VxWorks system / generic daemons. **Zero Vestas-app tasks** |
+| **9** | Network listener up | Vestas app opens AP / Firecrest / Firedrake ports | `nmap -p 8080,9482,...` from host shows listening ports | ❓ **unverified.** Generic `tFtpdTask`/`tNfsd` are spawned but we have NOT confirmed any port is actually bound + reachable. Host can't reach guest with current `-nic user` config |
 | **10** | Toolkit recognizes turbine | VMP6000 Toolkit lists our QEMU under "available turbines" with the right board ID | Toolkit UI screenshot showing CT6003_Motherboard_V3 entry | ⏳ |
 | **11** | Toolkit reads parameters | Toolkit reads a parameter (e.g. RatedPower) and gets a plausible value | Toolkit UI shows non-zero value, not "comm error" | ⏳ |
 | **12** | **Toolkit performs software load** | Toolkit pushes a firmware/binary file via Firedrake/AP and the turbine accepts it | Toolkit UI shows "load successful" + QEMU logs the FTP/Firedrake receive | ⏳ **END GOAL** |
 
-### Where we are: gate **3 cleared (TX walker proven), gate 4 implemented and partly verified.**
+### Where we are (honest): gate 3 cleared. Gate 4 wired but unexercised. Gates 5-9 NOT achieved.
 
-That's about **30-35% along the bar to gate 12.** Gates 5–6 are
-mechanical (~half-day each once BSP boot proceeds past the IP probe).
-Gates 7–9 are scoping unknowns (days each once the path is clear).
-Gates 10–12 are the **long pole** — weeks to months because we have
-to reverse-engineer enough of Vestas-proprietary protocols (AP,
-Firecrest, Firedrake, NEON) for the toolkit to be satisfied.
+Rough progress to gate 12: **~20-25%.** We have the hardware
+emulation (gates 0-3) plus a kernel that boots into a non-app idle
+state. The Vestas turbine application (`tApMain`, `tFirecrest`,
+`tFiredrake`, `tNeon`) is **not** running — those tasks aren't in
+the live task list. So the work between here and gate 12 is bigger
+than the 1-2 weeks for "gates 4-6" suggested. Realistic remaining:
+
+- **Gate 4 exercise** (small): switch netdev to allow host→guest traffic
+  (`-hostfwd` or tap), drive an inbound packet, watch `BestComm RX:`
+  fire and `tFecEndRx` unblock.
+- **Gates 5-7** (unknown size): figure out *why* the Vestas app doesn't
+  spawn. Possibilities: FS not mounted, `etc/startup.app` not present,
+  RTC sanity check fails, hardware key check fails, or this image is
+  intentionally service-only and a separate runtime is supposed to be
+  loaded. Likely needs filesystem emulation (Phase 2.5) or pre-loading
+  the runtime image.
+- **Gate 8** (medium-large): once the app runs, surface what hardware
+  it touches (CAN, GPIO, ATA, RTC, ARCnet) — each potentially a new
+  emulation gap.
+- **Gate 9** (small once 8 done): nmap the ports.
+- **Gates 10-12** (long pole, weeks-to-months): reverse-engineer the
+  proprietary protocols enough for the toolkit to accept the QEMU as
+  a real turbine and complete a software-load operation. This is the
+  dominant remaining work.
 
 **Concrete proof of gate 3:** the BSP's gratuitous ARP for IP
 `169.254.254.254` reaches the host via `qemu_send_packet`, captured
@@ -131,6 +149,43 @@ See `BIG_PICTURE_2026-04-28.md` for full evidence + `BSP_sram_layout_findings.md
 
 Append-only. New entries at the top. One line per decision.
 
+- **2026-04-29** — **BSP isn't blocked, but Vestas app isn't running
+  either.** Implemented SDMA Main IRQ delivery (`PerStat=0x20000000`
+  for Main source 0; W1C IntPending; IntMask gating — full reasoning
+  in `SESSION_LOG_2026-04-29.md`). Built a full `activeQHead`-walking
+  task-list dumper. **Findings:**
+  - BSP has 21 active VxWorks tasks: `tRootTask`, `tExcTask`,
+    `tLogTask`, `CpuloadLow/High`, `tLed`, `tWatchdog`, `tNetTask`,
+    `tFecEndRecover`, `tFecEndRx`, `tPortmapd`, `tMountd`, `tNfsd`,
+    `tNfsd0..3`, `tFtpdTask`, `tSntpsTask`, `tWdbTask`,
+    `confLogMsg`. All PEND'd on semaphores. `tRootTask` errno =
+    `S_objLib_OBJ_TIMEOUT` — boot task is idling.
+  - **No Vestas-app tasks present** (`tApMain`, `tFirecrest`,
+    `tFiredrake`, `tNeon` — none of these exist). This kernel image
+    on its own does NOT bring up the turbine application.
+  - BSP's `IntMask = 0xeffffff7` unmasks only RX (bit 3) and MDE
+    error (bit 28); TX (bit 2) is masked permanently — BSP doesn't
+    want a TX-completion IRQ. **Yesterday's SDMA-TX-IRQ blocker
+    hypothesis is invalidated.**
+  - The "1 ARP then idle" is just the gratuitous ARP at end of FEC
+    init. BSP listens after, doesn't attempt FTP boot.
+
+  **Honest reassessment (downgrades from prior optimism):**
+  - Gate 5 is bypassed but not "achieved" — we don't know if the BSP
+    has a usable FS or if it's just stuck at a different layer.
+  - Gate 6 is NOT achieved — no serial banner, no Vestas app.
+  - Gates 7-9 are **unverified**, not done. Service daemons being
+    spawned ≠ FS mounted ≠ ports reachable ≠ Vestas app running.
+  - Gate 8 is clearly NOT achieved (no Vestas-app tasks).
+
+  **What this means:** previous plan assumed BSP's only blocker was
+  network bringup. The real story: BSP boots a "service node"
+  configuration; the turbine application stack must come from
+  somewhere we haven't provided (likely `etc/startup.app` from a
+  filesystem). The path forward needs a filesystem (Phase 2.5) or a
+  preloaded runtime image (path A2 from earlier strategy doc).
+  **Next session: pick A2 vs A3 vs Phase 2.5 explicitly, and verify
+  RX walker with a host-injected packet (small fast win).**
 - **2026-04-28** — **Gate 3 SUBSTANTIALLY DONE.** TX BD walker is
   fully working: BSP's gratuitous ARP frame for `169.254.254.254` hits
   the host network (verified via `tcpdump` on filter-dump pcap):

@@ -244,3 +244,81 @@ Expected output:
 - `BestComm TX:   BD[0] @0xf0009400 status=0x4c00003c skb_pa=0x... len=60 TFD`
 - `BestComm TX:   sending frame, len=60`
 - pcap shows ARP request from `169.254.254.254`
+
+---
+
+## SDMA IRQ encoding (added 2026-04-29)
+
+Reverse-engineered the EXT-handler dispatch at vxworks `0x1178f0` (and
+the bootrom equivalent `m5200ExtIntrDeMux` @ `0x010da978`) plus the
+SDMA Main ISR at vxworks `0x132854`. Reference: `SESSION_LOG_2026-04-29.md`.
+
+### PerStat (MBAR+0x524) decoder
+
+Three dispatch lanes, each with its own bit-mask test:
+
+| Lane | Test mask | Source-ID extract | IRQ vector range |
+|---|---|---|---|
+| Critical | `r & 0x00000700` | `(r >> 8) & 0x3` | 49..52 |
+| **Main** | `r & 0x3F000000` | `(r >> 24) & 0x1F` | 0..31 |
+| Peripheral | `r & 0x003F0000` | `(r >> 16) & 0x1F` | 32..63 |
+
+Decoder code excerpts (vxworks):
+```
+117930: rlwinm r9,r31,0,21,23     ; mask 0x00000700 — critical lane
+117a90: andis. r27,r31,0x3F00     ; mask 0x3F000000 — main lane
+117a98: rlwinm r27,r31,8,27,31    ; r27 = (r >> 24) & 0x1F  → vector
+117aa8: andis. r9,r31,0x3F        ; mask 0x003F0000 — peripheral lane
+```
+
+### SDMA Main ISR
+
+Registered via `intConnect(0, 0x132854, ...)` at vxworks `0x1329a0` —
+SDMA is **Main IRQ #0**, *not* an external vector 0x27/0x28.
+
+```
+132854: lis r9,69; lwz r10,10336(r9)  ; r10 = TaskBAR
+13285c: lwz r8,20(r10)                 ; r8 = *(MBAR+0x1214) IntPending
+132860: lwz r9,24(r10)                 ; r9 = *(MBAR+0x1218) IntMask
+132864: andc r8,r8,r9                  ; unmasked = IntPending & ~IntMask
+132868: andis. r9,r8,0x1000            ; test MDE-error bit (bit 28)
+```
+
+### IntPending / IntMask semantics
+
+- **IntPending (`MBAR+0x1214`)** is **W1C** on writes. Per-task ACK
+  helper at `0x12e8a8`: `slw r10,r10=1,r9=taskID; stw r10, MBAR+0x1214`.
+  Bit numbering: **LSB**, task N at bit N. FEC TX = task 2 → bit 2 →
+  `0x00000004`. FEC RX = task 3 → bit 3 → `0x00000008`.
+
+- **IntMask (`MBAR+0x1218`)** convention: **`1 = MASKED, 0 = ENABLED`**.
+  Init writes `0xFFFFFFFF` (everything masked) at `0x132960`. Disable
+  task: `IntMask |= (1<<id)` (`0x12e84c`). Enable task: `IntMask &=
+  ~(1<<id)` (`0x12e8e0..0x12e8ec`).
+
+### What our QEMU stub must return
+
+When `(IntPending & ~IntMask) != 0`:
+- `mpc5200_mmio_read(0x524)` returns **`0x20000000`** (main valid bit
+  PPC bit 2, source-ID = 0). Decoder finds main lane non-zero, source
+  field = 0 → dispatches to vector 0 → SDMA Main ISR.
+- Do **not** read-to-clear PerStat for SDMA. The source clears via the
+  BSP's W1C of IntPending.
+
+The earlier hypothesis `0x20240000` (PSe=0x20, MSe=0x24) is wrong —
+the cheat-sheet conflated peripheral encoding with main, and SDMA is
+on Main #0, not LO_int #4.
+
+### Observed BSP IntMask sequence (this image)
+
+| Order | NIP | Value | Decode |
+|---|---|---|---|
+| 1 | 0x132960 | `0xFFFFFFFF` | init: all masked |
+| 2 | 0x1328c8 | `0xEFFFFFFF` | bit 28 (MDE error) unmasked |
+| 3 | 0x1328f0 | `0xEFFFFFF7` | bit 3 (FEC RX, task 3) unmasked |
+
+**Bit 2 (FEC TX) is never unmasked.** The BSP doesn't expect SDMA TX
+completion IRQ; it presumably polls TX status or relies on FEC's
+peripheral EIR.TXF (which we already deliver via `ic_fec_pending →
+0x25240000`). Implication: any future planning that hinges on "BSP
+awaits SDMA TX-done IRQ" is incorrect.
