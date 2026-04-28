@@ -71,10 +71,66 @@ pivot using Daniele's findings.
 | RTC time-of-day wait | Fix X1226 RTC counter readback first |
 | GPT timer wait | Model GPT block, return to FEC after |
 | Proprietary boot protocol | Keep FEC device, replace vsftpd with custom shim |
+| Filesystem mount failure  | Pivot to disk-image + ATA model (Phase 2.5) instead of FTP |
 
 If Daniele finishes first and contradicts the hypothesis, Kasper saves
 days of wasted FEC work. If confirmed, Kasper's track was correct
 anyway.
+
+---
+
+## Open questions / unknowns
+
+Live questions we don't have answers to yet. Folded into existing
+tracks where they fit; promoted to standalone investigations only when
+necessary.
+
+### How is `/ata0a/` mounted on the real controller?
+
+Node 10 files were dumped from a working turbine on Røye2 via the
+Vestas **Firedrake** protocol, but we don't know how VxWorks mounts
+that filesystem on the real hardware: which device (ATA controller?
+TrueFFS? CompactFlash via the MPC5200 ATA block?), which FS type
+(`dosFs`, `tffsDrv`, raw `iosDevAdd`?), what partition layout, what
+the BSP's mount call site looks like.
+
+**Folded into Daniele's track** as a secondary task: same toolchain
+(symbol search + disassembly of `vxworks.out`), and the answer may
+overlap with the park diagnosis — if VxWorks parks on a failed mount
+rather than an FTP wait, the verdict on `0x207fe8` flips entirely.
+
+**Phase 2.5 — actual mount in QEMU:** see
+[`PLAN_Phase2.5_filesystem.md`](PLAN_Phase2.5_filesystem.md).
+Gated on Daniele's findings — shape of the work depends on whether
+the kernel boots from FS or from FTP-pushed binaries.
+
+### How does the BSP decide boot-mode vs runmode?
+
+Boot mode = wait for FTP push at 169.254.254.254. Runmode = boot from
+`/ata0a/` and run `etc/startup.app`. What flips the switch on real
+hardware? Possibilities:
+- Hardware jumper / GPIO pin
+- Filesystem state (e.g. presence of a marker file)
+- Bootline parameter in the boot ROM
+- Some I/O register we're stubbing as zero
+
+If we can force runmode by populating `/ata0a/` correctly, we may not
+need to model the FTP push at all. Folded into Daniele's track.
+
+### BestComm DMA dependency for FEC packet flow
+
+If the FEC uses BestComm DMA tasks for TX/RX rather than direct
+register MMIO (the same pattern that blocks PSC), then Kasper's FEC
+device won't actually move packets without a BestComm task executor.
+Already noted in `PLAN_Kasper.md` risks. If observed during
+integration, escalate to Phase 2b (BestComm task model).
+
+### RTC time-of-day plausibility check
+
+VxWorks BSPs often refuse to boot if the RTC reads a time before some
+sanity threshold (e.g. before 2000-01-01). Our X1226 stub returns
+zeroed RTC bytes. If Daniele's diagnosis points at an RTC read loop,
+this is the fix.
 
 ---
 

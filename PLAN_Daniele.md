@@ -21,15 +21,34 @@ question directly from the binary.
 
 ---
 
-## The question
+## The questions
 
-**At NIP `0x207fe8`, what is the BSP actually waiting for?**
+### Primary — what is parked at `0x207fe8`?
 
-Sub-questions:
 1. What memory location or peripheral register is being polled?
 2. Which task (in WIND_TCB sense) is parked, and on what blocker?
 3. If the answer is "FTP push", what protocol exactly — RFC 959, or
    something Vestas-proprietary?
+
+### Secondary — how is `/ata0a/` mounted?
+
+Node 10 files were dumped from a working Røye2 turbine via Firedrake.
+We don't know how VxWorks mounts that filesystem on real hardware —
+need this for Phase 2.5 (actually mounting it in QEMU). May also
+overlap with the primary question: if the kernel parks on a failed FS
+mount rather than an FTP wait, the verdict on `0x207fe8` flips.
+
+Sub-questions:
+1. Which device backs `/ata0a/`? ATA controller (MPC5200 has one),
+   TrueFFS over flash, CompactFlash, or something else?
+2. Which FS type? `dosFs` (FAT-style), `tffsDrv`, raw `iosDevAdd`?
+3. What partition layout does it expect (MBR? FAT16/32? raw block 0)?
+4. What's the call site in the BSP that does the mount? Symbol-search
+   targets: `dosFsDevInit`, `dosFsMkfs`, `usrMmcFsInit`, `ataDrv`,
+   `ataDevCreate`, `tffsDrv`, `usrFdiskPartRead`, `iosDevAdd` calls.
+5. What's the boot-mode vs runmode trigger? Hardware jumper, FS
+   marker file, bootline param, I/O register? If we can force runmode
+   by pre-populating `/ata0a/`, we may sidestep the FTP push entirely.
 
 ---
 
@@ -106,6 +125,25 @@ If Step 1+2 point at network wait:
 4. If not: best-effort guess (RFC 959 FTP is the Occam's razor answer
    given the APIPA pattern)
 
+### Step 4 — filesystem mount investigation
+
+Independent of the park question, document how `/ata0a/` is brought
+up:
+
+1. Symbol search: `nm vxworks.out | grep -iE
+   "dosfs|tffs|atadrv|atadevcreate|iosdevadd|fdisk"`. Identify which
+   filesystem and device drivers are linked in.
+2. Find the BSP call site that mounts `/ata0a/`. Likely candidates:
+   `usrRoot`, `sysFsBootInit`, or a `sysHwInit2` extension. Walk the
+   call graph from there.
+3. Decode the device-create call: what device descriptor, what
+   partition number, what block size?
+4. Look for the boot-mode vs runmode decision: branch on a hardware
+   reg, a bootline string, or a marker file presence. Document the
+   trigger.
+5. Note the expected directory layout under `/ata0a/`. Compare to the
+   Røye2 dump — does `etc/startup.app` live where the BSP expects?
+
 ---
 
 ## Deliverable
@@ -140,6 +178,13 @@ Write `BSP_park_findings.md` (repo root) with:
 Task name: <e.g. tBootInit>
 Blocked on: <semaphore / message queue / direct poll loop>
 TCB status: 0x<hex>
+
+### Filesystem mount on real hardware
+- Device: <ata0 / tffs0 / other>
+- FS type: <dosFs / tffsDrv / raw / other>
+- Mount call site: <symbol + offset>
+- Boot-mode vs runmode trigger: <jumper / bootline / marker file>
+- Expected layout under `/ata0a/`: <key paths checked at boot>
 
 ### Protocol (if network wait)
 - Standard FTP / TFTP / proprietary
