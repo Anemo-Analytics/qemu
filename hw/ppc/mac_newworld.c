@@ -441,12 +441,21 @@ static uint64_t mpc5200_mmio_read(void *opaque, hwaddr offset, unsigned size)
         return (uint64_t)b << 24;
     }
     /*
-     * PSC1-6 Status Registers (SR at PSCn_base+4):
-     *   PSC1: MBAR+0x2004, PSC2: 0x2204, PSC3: 0x2404, ...
-     * Return TxRDY=bit5 + TxEMP=bit4 = 0x30 in the SR byte.
-     * Also return TxRDY for FIFO status and similar registers.
+     * PSC1-6: log reads + return plausible "TX always ready" status.
      */
     if (offset >= 0x2000 && offset < 0x2c00) {
+        static unsigned psc_r_log = 0;
+        if (psc_r_log++ < 200) {
+            unsigned psc_idx, reg;
+            if (offset < 0x2200)      { psc_idx = 1; reg = offset - 0x2000; }
+            else if (offset < 0x2400) { psc_idx = 2; reg = offset - 0x2200; }
+            else if (offset < 0x2600) { psc_idx = 3; reg = offset - 0x2400; }
+            else if (offset < 0x2800) { psc_idx = 4; reg = offset - 0x2600; }
+            else if (offset < 0x2A00) { psc_idx = 5; reg = offset - 0x2800; }
+            else                      { psc_idx = 6; reg = offset - 0x2A00; }
+            fprintf(stderr, "PSC%u R +0x%02x sz=%u\n", psc_idx, reg, size);
+            fflush(stderr);
+        }
         return 0x30303030; /* all bytes = TxRDY+TxEMP set */
     }
     mpc5200_log_access("R", offset, 0, size);
@@ -609,13 +618,40 @@ static void mpc5200_mmio_write(void *opaque, hwaddr offset,
             return;
         }
     }
-    /* PSC TX data: PSCn at MBAR+0x2000, TX buffer at PSCn+0x0c */
+    /* PSC1-6 at MBAR+0x2000..0x2C00 */
     if (offset >= 0x2000 && offset < 0x2c00) {
-        if ((offset & 0xff) == 0x0c) {
+        unsigned psc_idx;
+        unsigned reg;
+        /* PSC1=0x2000, PSC2=0x2200, PSC3=0x2400, PSC4=0x2600, PSC5=0x2800, PSC6=0x2C00 */
+        if (offset < 0x2200)      { psc_idx = 1; reg = offset - 0x2000; }
+        else if (offset < 0x2400) { psc_idx = 2; reg = offset - 0x2200; }
+        else if (offset < 0x2600) { psc_idx = 3; reg = offset - 0x2400; }
+        else if (offset < 0x2800) { psc_idx = 4; reg = offset - 0x2600; }
+        else if (offset < 0x2A00) { psc_idx = 5; reg = offset - 0x2800; }
+        else                      { psc_idx = 6; reg = offset - 0x2A00; }
+
+        /*
+         * Console-output routing: any write to a TX data path on PSC1
+         * (the standard VxWorks console). Both legacy non-FIFO TX
+         * buffer (offset 0x0c) and FIFO-mode TX data (offset 0x40)
+         * are checked. Bytes are dumped as ASCII to stderr — this
+         * gives us BSP log messages.
+         */
+        if (psc_idx == 1 && (reg == 0x0c || reg == 0x40 || reg == 0x10)) {
             uint8_t ch = value & 0xff;
-            fprintf(stderr, "PSC_TX[%04x]: 0x%02x '%c'\n",
-                    (unsigned)offset, ch, (ch >= 0x20 && ch < 0x7f) ? ch : '.');
+            fprintf(stderr, "%c", (ch >= 0x20 && ch < 0x7f) || ch == '\n' || ch == '\r'
+                                   ? ch : '.');
             fflush(stderr);
+            return;
+        }
+        /* Diagnostic: log first 200 PSC writes outside the TX path. */
+        {
+            static unsigned psc_log = 0;
+            if (psc_log++ < 200) {
+                fprintf(stderr, "PSC%u W +0x%02x sz=%u val=0x%08x\n",
+                        psc_idx, reg, size, (unsigned)value);
+                fflush(stderr);
+            }
         }
         return;
     }
