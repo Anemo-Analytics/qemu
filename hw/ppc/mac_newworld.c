@@ -148,7 +148,8 @@ typedef struct {
     MemoryRegion     mr;
     QEMUTimer       *timer;
     PowerPCCPU      *cpu;
-    bool             ic_pending;
+    bool             ic_pending;     /* legacy: SLT1 timer pending */
+    bool             ic_fec_pending; /* FEC peripheral interrupt pending */
     MPC5200I2CState  i2c2;
     /*
      * BestComm/SDMA register file (MBAR+0x1200..0x12FF). Modeled as plain
@@ -184,18 +185,29 @@ static void mpc5200_i2c2_init(MPC5200I2CState *i2c)
 #define MPC5200_VEC_GARBAGE_AT_508 0x13e00c08u
 
 /*
- * Hook to route the FEC's level-sensitive IRQ output into the existing
- * IC/EXT path. First-cut: any FEC IRQ assertion sets ic_pending and
- * raises EXT, mirroring the SLT1 path. The BSP's EXT handler will read
- * the FEC's EIR to decode the actual cause. Deassertion is handled by
- * the existing 0x524 read-to-clear in mpc5200_mmio_read.
+ * Hook to route the FEC's level-sensitive IRQ output into the EXT path.
+ * The IC dispatch (0x524 PerStat/MainStat encoded register) needs to
+ * report this as peripheral source 5 (Ethernet) routed via Main
+ * source 4 (LO_int) so the BSP's EXT handler dispatches to the FEC ISR
+ * (m5200FecInt) and not the SLT1 timer ISR. See mpc5200_mmio_read for
+ * the 0x524 path.
  */
 static void mpc5200_fec_irq_handler(void *opaque, int n, int level)
 {
     MPC5200State *s = opaque;
+    static unsigned log_count = 0;
+    if (log_count++ < 16) {
+        fprintf(stderr, "FEC IRQ -> %d\n", level);
+        fflush(stderr);
+    }
     if (level) {
-        s->ic_pending = true;
+        s->ic_fec_pending = true;
         ppc_set_irq(s->cpu, PPC_INTERRUPT_EXT, 1);
+    } else {
+        s->ic_fec_pending = false;
+        if (!s->ic_pending) {
+            ppc_set_irq(s->cpu, PPC_INTERRUPT_EXT, 0);
+        }
     }
 }
 
@@ -277,15 +289,37 @@ static uint64_t mpc5200_mmio_read(void *opaque, hwaddr offset, unsigned size)
 {
     MPC5200State *s = opaque;
 
-    /* IC: ICTL_MAIN_TASK_PRIO_ACTIVE_PEND — SLT1 as active source */
+    /*
+     * IC: 0x508 — Peripheral Priority and HI/LO Select 2 (per manual).
+     * Existing stub returned 0x00000001 when ic_pending and the SLT1
+     * dispatch path worked. Preserving for SLT; FEC dispatch goes via
+     * 0x524 only.
+     */
     if (offset == 0x0508 && s->ic_pending) {
         return 0x00000001;
     }
     /*
-     * IC: PerEnc (Peripheral Encoded) — read by EXT handler to dispatch.
-     * Bit 30 indicates SLT1 as active source. Read-to-clear deasserts EXT
-     * here so the handler returning via rfi doesn't immediately re-fire.
+     * IC: 0x524 — PerStat/MainStat/CritStat Encoded (manual §7.2.4.9).
+     *   bits  2:7 = PSe (Peripheral Status Encoded, 6 bits = flag+5-bit src)
+     *   bits 10:15 = MSe (Main Status Encoded, 6 bits = flag+5-bit src)
+     *   bits 21:23 = CSe (Critical, 3 bits)
+     * For an active FEC interrupt:
+     *   PSe = 0x25  (flag=1, peripheral source 5 = Ethernet)
+     *   MSe = 0x24  (flag=1, main source 4 = LO_int — peripheral group)
+     *   value = (0x25 << 24) | (0x24 << 16) = 0x25240000
+     * For SLT1 (legacy stub behaviour) we keep the working value
+     * 0x40000000 — this is in a reserved bit per manual but it's what
+     * the BSP's EXT handler expects given how it was developed.
+     * Read-to-clear: deassert EXT after the handler reads us. The level
+     * will re-assert if a source is still active.
      */
+    if (offset == 0x0524 && s->ic_fec_pending) {
+        s->ic_fec_pending = false;
+        if (!s->ic_pending) {
+            ppc_set_irq(s->cpu, PPC_INTERRUPT_EXT, 0);
+        }
+        return 0x25240000;
+    }
     if (offset == 0x0524 && s->ic_pending) {
         s->ic_pending = false;
         ppc_set_irq(s->cpu, PPC_INTERRUPT_EXT, 0);

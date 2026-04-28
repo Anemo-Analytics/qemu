@@ -213,7 +213,15 @@ static uint64_t mpc5200_fec_read(void *opaque, hwaddr offset, unsigned size)
 
     {
         static unsigned log_count = 0;
-        if (log_count++ < 100) {
+        /* Always log MMFR/EIR reads for diagnostics */
+        if (offset == FEC_MMFR || offset == FEC_EIR) {
+            if (log_count < 4000) {
+                fprintf(stderr, "FEC R +0x%03x => 0x%08x\n",
+                        (unsigned)offset, v);
+                fflush(stderr);
+                log_count++;
+            }
+        } else if (log_count++ < 100) {
             fprintf(stderr, "FEC R +0x%03x => 0x%08x\n",
                     (unsigned)offset, v);
             fflush(stderr);
