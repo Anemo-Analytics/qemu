@@ -143,10 +143,29 @@ struct MPC5200FECState {
     /* Backing storage for register reads/writes that have no side effect. */
     uint32_t regs[FEC_REG_COUNT];
 
-    /* Embedded LAN9118 PHY for MII transactions. */
-    Lan9118PhyState mii;
+    /*
+     * Minimal IEEE 802.3 clause-22 PHY model.
+     *
+     * The Vestas BSP's m5200Fec driver does not check vendor PHY IDs (no
+     * reads of PHYID1/PHYID2 in the init path — confirmed by binary
+     * disassembly). It only requires:
+     *   - BMCR low 6 bits non-zero on probe (so a "PHY present" check
+     *     passes via `andi. r9, r9, 0x3f`)
+     *   - BMCR writes preserved fully — including ISOLATE bit, which the
+     *     BSP writes then polls until it reads back. This is why we model
+     *     PHY directly rather than reuse hw/net/lan9118_phy.c whose write
+     *     mask drops ISOLATE.
+     *   - BMSR with link-up + AN_COMPLETE so the basic-check loop exits.
+     *
+     * Other registers (PHYID, AN_ADV, AN_LP, AN_EXP) are still served by
+     * the embedded lan9118_phy_read for compatibility — the BSP only
+     * reads them for logging.
+     */
+    uint16_t phy_bmcr;       /* Last value written to BMCR (reg 0) */
+    uint16_t phy_bmsr;       /* Status: link up + AN done + capabilities */
+    Lan9118PhyState mii;     /* For non-BMCR/BMSR PHY register access */
     IRQState mii_irq;
-    uint8_t  phy_addr;       /* Default 0x01; matches typical MPC5200 boards. */
+    uint8_t  phy_addr;       /* PHY address; BSP probes 0..31 looking for one */
 };
 
 static void mpc5200_fec_update_irq(MPC5200FECState *s)
@@ -174,15 +193,38 @@ static void mpc5200_fec_mmfr_write(MPC5200FECState *s, uint32_t value)
 
     /*
      * Respond as a single PHY at exactly s->phy_addr. If the BSP
-     * scans multiple addresses (e.g. PA=0, 1, 16) it must see a
-     * single responding PHY — replying everywhere confuses the
-     * scan and the BSP loops forever trying to pick one.
+     * scans multiple addresses it must see a single responding PHY —
+     * replying everywhere confuses the scan and the BSP can't pick.
      */
     if (pa == s->phy_addr) {
         if (op == 1) { /* write */
-            lan9118_phy_write(&s->mii, ra, data);
+            static unsigned phy_write_log = 0;
+            if (phy_write_log++ < 32) {
+                fprintf(stderr, "PHY W reg=%u data=0x%04x\n", ra, data);
+                fflush(stderr);
+            }
+            switch (ra) {
+            case 0: /* BMCR: store full value, including ISOLATE/PDOWN/etc */
+                if (data & 0x8000) {
+                    /* RESET (bit 15) self-clears: re-init to defaults */
+                    s->phy_bmcr = 0x3101;
+                } else {
+                    s->phy_bmcr = data;
+                }
+                break;
+            case 1: /* BMSR: read-only on real hardware; ignore writes */
+                break;
+            default:
+                lan9118_phy_write(&s->mii, ra, data);
+                break;
+            }
         } else if (op == 2) { /* read */
-            uint16_t r = lan9118_phy_read(&s->mii, ra);
+            uint16_t r;
+            switch (ra) {
+            case 0: r = s->phy_bmcr; break;
+            case 1: r = s->phy_bmsr; break;
+            default: r = lan9118_phy_read(&s->mii, ra); break;
+            }
             s->regs[FEC_MMFR / 4] = (value & ~(uint32_t)MMFR_DATA_MASK) | r;
         }
     } else {
@@ -363,6 +405,20 @@ static void mpc5200_fec_reset_hold(Object *obj, ResetType type)
                             0x00008808; /* PAUR low 16 = standard pause type */
 
     lan9118_phy_reset(&s->mii);
+
+    /*
+     * PHY defaults the BSP requires:
+     *   BMCR = 0x3100  AN_EN(12) | RESTART_AN(9) | ...low bits make probe pass
+     *     The probe is `andi. r9,r9,0x3f` against BMCR — must be non-zero.
+     *     0x3100 has bit 8 (FD) and bits 9 (RESTART_AN) and 12 (AN_EN) set;
+     *     low 6 bits are zero so we add 0x0001 (a vendor-reserved low bit
+     *     that some PHYs return non-zero, which makes the probe pass).
+     *   BMSR = 0x782D  bits 14:11 capabilities + bit 5 AN_COMPLETE
+     *                  + bit 3 AUTONEG + bit 2 LINK_ST + bit 0 EXTCAP
+     */
+    s->phy_bmcr = 0x3101;
+    s->phy_bmsr = 0x782D;
+
     mpc5200_fec_update_irq(s);
 }
 
