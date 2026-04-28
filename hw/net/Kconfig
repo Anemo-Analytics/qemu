@@ -95,6 +95,10 @@ config IMX_FEC
     bool
     select LAN9118_PHY
 
+config MPC5200_FEC
+    bool
+    select LAN9118_PHY
+
 config CADENCE
     bool
 

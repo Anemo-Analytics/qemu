@@ -80,27 +80,53 @@ Understand:
 ### 2. Create `hw/net/mpc5200_fec.c`
 
 Fork from `imx_fec.c`. Adjust register offsets to MPC5200's actual
-layout. Confirmed offsets observed in BSP traces during current
-sessions:
+layout — **earlier "observed" offsets in this plan were wrong**, the
+correct map per `docs/MPC5200_FEC_Chapter14.md` is:
 
 | Offset | Register |
 |---|---|
-| `0x004` | EIR (event/interrupt) |
-| `0x008` | EIMR (interrupt mask) |
-| `0x024` | ECR (Ethernet control) |
-| `0x040` | RDAR (receive descriptor active) |
-| `0x044` | TDAR (transmit descriptor active) |
-| `0x0E4` | MMFR (PHY MII data) |
-| `0x0E8` | MSCR (PHY MII speed) |
-| `0x118` | RDSR (RX BD ring base) |
-| `0x11C` | TDSR (TX BD ring base) |
-| `0x120`–`0x124` | additional ring config |
-| `0x144` | MIBC (statistics counter control) |
-| `0x188`–`0x1C8` | queue config |
+| `0x000` | FEC_ID |
+| `0x004` | EIR — Interrupt Event |
+| `0x008` | EIMR — Interrupt Enable |
+| `0x010` | RDAR — Rx Descriptor Active |
+| `0x014` | TDAR — Tx Descriptor Active |
+| `0x024` | ECR — Ethernet Control |
+| `0x040` | MMFR — MII Management Frame |
+| `0x044` | MSCR — MII Speed Control |
+| `0x064` | MIBC — MIB Control |
+| `0x084` | R_CNTRL — Receive Control |
+| `0x088` | Hash |
+| `0x0C4` | X_CNTRL — Tx Control |
+| `0x0E4` | PALR — Physical Address Low |
+| `0x0E8` | PAUR — Physical Address High |
+| `0x0EC` | OP_PAUSE — Opcode/Pause Duration |
+| `0x118` | IADDR1 — Individual Address 1 (MAC filter) |
+| `0x11C` | IADDR2 — Individual Address 2 (MAC filter) |
+| `0x120` | GADDR1 — Group Address 1 (multicast) |
+| `0x124` | GADDR2 — Group Address 2 (multicast) |
+| `0x144` | X_WMRK — Tx FIFO Watermark |
+| `0x184–0x1A0` | Rx FIFO data/status/control/pointers |
+| `0x1A4–0x1C0` | Tx FIFO data/status/control/pointers |
 
-Verify offsets against MPC5200 user manual section 26 (FEC) — the
-vault should have it. Don't trust observation alone; we may have
-missed offsets the BSP didn't poke yet.
+**Architectural surprise vs i.MX FEC:** the MPC5200 FEC has **no BD
+ring base registers** (no RDSR/TDSR like the i.MX has). The BD rings
+are owned by BestComm task descriptors stored in internal SRAM
+(MBAR+0x8000..0xBFFF), not by the FEC itself. The FEC only knows
+about its FIFOs; BestComm shovels bytes between system memory and the
+FEC FIFO via DMA tasks.
+
+This means the imx_fec.c BD walker functions (`imx_fec_do_tx`,
+`imx_fec_receive`) **do not port directly** — TX/RX in the MPC5200
+goes:
+
+```
+TX:  system mem → BestComm task → FEC Tx FIFO (0x1A4) → wire
+RX:  wire → FEC Rx FIFO (0x184) → BestComm task → system mem
+```
+
+Step 3 below details the BestComm-driven flow. The FEC device-model
+itself becomes mostly a CSR/MII model + FIFO mailbox; the data-path
+logic lives in the BestComm executor.
 
 Rename the QOM type to `TYPE_MPC5200_FEC = "mpc5200-fec"`.
 

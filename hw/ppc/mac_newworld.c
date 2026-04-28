@@ -60,6 +60,7 @@
 #include "hw/input/adb.h"
 #include "hw/ppc/mac_dbdma.h"
 #include "hw/pci/pci.h"
+#include "hw/irq.h"
 #include "net/net.h"
 #include "system/system.h"
 #include "hw/nvram/fw_cfg.h"
@@ -181,6 +182,22 @@ static void mpc5200_i2c2_init(MPC5200I2CState *i2c)
  * `vpmsumb` opcode and is what triggered the original loop.
  */
 #define MPC5200_VEC_GARBAGE_AT_508 0x13e00c08u
+
+/*
+ * Hook to route the FEC's level-sensitive IRQ output into the existing
+ * IC/EXT path. First-cut: any FEC IRQ assertion sets ic_pending and
+ * raises EXT, mirroring the SLT1 path. The BSP's EXT handler will read
+ * the FEC's EIR to decode the actual cause. Deassertion is handled by
+ * the existing 0x524 read-to-clear in mpc5200_mmio_read.
+ */
+static void mpc5200_fec_irq_handler(void *opaque, int n, int level)
+{
+    MPC5200State *s = opaque;
+    if (level) {
+        s->ic_pending = true;
+        ppc_set_irq(s->cpu, PPC_INTERRUPT_EXT, 1);
+    }
+}
 
 static void mpc5200_tick(void *opaque)
 {
@@ -879,6 +896,26 @@ static void ppc_core99_init(MachineState *machine)
     memory_region_init_io(&mpc5200->mr, NULL, &mpc5200_mmio_ops, mpc5200,
                           "mpc5200-mmio", 1 * MiB);
     memory_region_add_subregion(get_system_memory(), 0xf0000000, &mpc5200->mr);
+
+    /*
+     * MPC5200 Fast Ethernet Controller (FEC) at MBAR+0x3000.
+     * Overlaps the broader MMIO stub with higher priority so its
+     * 0x3000..0x33FF range is handled here instead of the fall-through
+     * stub. IRQ output drives the existing EXT path via ic_pending.
+     */
+    {
+        DeviceState *fec = qdev_new("mpc5200-fec");
+        qemu_configure_nic_device(fec, true, "mpc5200-fec");
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(fec), &error_fatal);
+        memory_region_add_subregion_overlap(
+            get_system_memory(),
+            0xf0000000 + 0x3000,
+            sysbus_mmio_get_region(SYS_BUS_DEVICE(fec), 0),
+            1);
+        sysbus_connect_irq(SYS_BUS_DEVICE(fec), 0,
+                           qemu_allocate_irq(mpc5200_fec_irq_handler,
+                                             mpc5200, 0));
+    }
 
     /* MPC5200 internal SRAM at 0x601f8000 (64 KiB) */
     memory_region_init_ram(sram, NULL, "mpc5200-sram", 64 * KiB, &error_fatal);
