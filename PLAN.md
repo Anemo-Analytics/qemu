@@ -121,6 +121,18 @@ the toolkit to be satisfied.
 
 Append-only. New entries at the top. One line per decision.
 
+- **2026-04-28** — Gate 3 partial progress. BMCR fix (0x3101 → 0x3100,
+  low reserved bits cleared) **unblocks PHY init** — BSP now runs full
+  m5200FecMiiBasicCheck (ISOLATE-toggle, RESET, ANAR=0x01E1, BMSR poll,
+  ANER/LPA reads) and reaches ECR.ETHER_EN + GADDR1 + R_CNTRL +
+  X_CNTRL + MSCR. **But still no TCR write** in 60s wall-clock. The
+  BSP completes 72 FEC writes including all PHY config, but the
+  BestComm SDMA TX/RX setup at vxworks.out 0x20bbd8/0x20b9fc never
+  runs. EndLoad must abort somewhere between MII basic check and
+  SDMA setup (the `bl 0x20bbd8` at 0x12c878). Next session: target
+  exactly that gap — disassemble m5200FecEndLoad between lines
+  0x12c7f4 (post-MII) and 0x12c878 (SDMA TX call) to find the missing
+  check. Also: TX BD walker scaffolding committed but unexercised.
 - **2026-04-28** — Bootrom direct-boot **DROPPED** as a path forward.
   Implemented a fast NIP/MSR/DEC sampler in `mac_newworld.c` (100 µs
   virtual time, 42 stations, top-30 histogram). Dynamic data shows
