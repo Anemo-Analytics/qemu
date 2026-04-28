@@ -121,6 +121,25 @@ the toolkit to be satisfied.
 
 Append-only. New entries at the top. One line per decision.
 
+- **2026-04-28** — **Gate 3 hardware unblocked.** Single-line fix:
+  `mpc5200->cpu->env.spr[SPR_MBAR] = 0xF0000000` in mac_newworld_init
+  (and re-applied in SLT tick handler in case CPU reset clobbers).
+  QEMU's generic G2 SPR init resets MBAR (SPR 638) to 0, but MPC5200
+  hardware reset value is `0xF0000000`. BSP's `vxMBarGet()` reads SPR
+  638, stores to `*(0x908918)`, downstream `TaskSetup_TASK_FEC_TX/RX`
+  computes TCR addresses as `MBAR + slot*2 + 0x121C`. With MBAR=0,
+  writes went to physical low-RAM 0x1220 silently. Now:
+  - TCR[2]=0x00C2 (ENABLE) at MBAR+0x1220 ✓
+  - TCR[3]=0x00C3 (ENABLE) at MBAR+0x1222 ✓
+  - vxDecSet REACHED (DEC armed in runtime) ✓
+  - sysClkInt REACHED (DEC ISR running) ✓
+  - 16 FEC IRQ transitions ✓
+  - Our TX BD walker triggers (6 walks observed)
+  Walker reports "BD ring fields look bogus" because the handle
+  wrapper at BSS@0x008CFC00 has a Vestas-specific layout, not the
+  Linux MOTbcommlib one. Real var-table lives in SRAM via TDT (per
+  `BSP_var_table_findings.md`). Next session: TDT-snoop in SRAM
+  to find real var-table, then walk actual BDs.
 - **2026-04-28** — Gate 3 partial progress. BMCR fix (0x3101 → 0x3100,
   low reserved bits cleared) **unblocks PHY init** — BSP now runs full
   m5200FecMiiBasicCheck (ISOLATE-toggle, RESET, ANAR=0x01E1, BMSR poll,
