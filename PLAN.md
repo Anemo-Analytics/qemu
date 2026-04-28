@@ -121,6 +121,31 @@ the toolkit to be satisfied.
 
 Append-only. New entries at the top. One line per decision.
 
+- **2026-04-28** — Bootrom direct-boot **DROPPED** as a path forward.
+  Implemented a fast NIP/MSR/DEC sampler in `mac_newworld.c` (100 µs
+  virtual time, 42 stations, top-30 histogram). Dynamic data shows
+  the bootrom reaches `kernelInit` and `windExit` but **never
+  dispatches `usrRoot`** — `windLoadContext` UNREACHED, `vxDecSet`
+  UNREACHED, CPU spends 98% of samples at `0x0100107c` (intUnlock
+  body / kernel idle loop). vxworks.out by contrast hits `sysClkInt`
+  (DEC ISR) cleanly under the same QEMU. The bootrom scheduler wedge
+  is upstream of the comparison-study's predicted window — fixing it
+  would require deep VxWorks kernel-scheduler investigation
+  (3–5 days+) for no gate 3 benefit. See
+  `BSP_bootrom_scheduler_findings.md`. Stay with path A1
+  (vxworks.out + FTP boot via FEC + BestComm executor).
+- **2026-04-28** — Comparison study (`BSP_comparison_study.md`) RESOLVED
+  the "DEC fires for vxworks.out but not bootrom" mystery. Both binaries
+  share identical DEC code (`sysClkEnable → vxDecSet @ mtspr 22`, single
+  arming site reached from `usrRoot+0x44`). The bootrom never reaches
+  it: usrRoot wedges in the 5-instruction window
+  `0x010d6108..0x010d613c` (memInit → memAddToPool → usrMmuInit →
+  sysClkConnect → sysClkRateSet → sysClkEnable). MSR[IP] hypothesis
+  REFUTED (entry MSR=0x2002, IP=0). "DEC delivery broken in QEMU"
+  REFUTED (vxworks.out fires DEC fine, 291 DECR / 4 s). Decision: keep
+  path A1 (FTP recovery boot via vxworks.out) as primary; bootrom
+  direct-load is unblocked only by a ½-day NIP-trip breakpoint study to
+  pinpoint the wedge step. See `BSP_comparison_study.md`.
 - **2026-04-28** — Chose path A1 (FTP recovery boot) over A2 (pre-loaded
   runtime) and A3 (tffs cold-start). Reason: richest test surface;
   BestComm executor needed for gate 9 anyway so not wasted; cost ~2
@@ -141,7 +166,9 @@ What to read in order, after a week away:
 
 1. **`PLAN.md`** (this file) — current gate position + decisions log
 2. **Most recent findings doc** — raw evidence for current state
-   - Latest: `BSP_fec_bestcomm_findings.md` (gate-3 wiring intel)
+   - Latest: `BSP_bootrom_scheduler_findings.md` (bootrom scheduler wedge pinpointed; bootrom path dropped)
+   - Prior: `BSP_comparison_study.md` (vxworks.out vs bootrom DEC mystery resolved)
+   - Prior: `BSP_fec_bestcomm_findings.md` (gate-3 wiring intel)
 3. **Whichever per-person plan is active** — current work checklist
    - Active: `PLAN_Kasper.md` (steps 1,2,4,5,6 done; step 3 in progress)
    - Retired: `PLAN_Daniele.md` (his work is done)

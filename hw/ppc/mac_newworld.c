@@ -147,6 +147,7 @@ typedef struct {
 typedef struct {
     MemoryRegion     mr;
     QEMUTimer       *timer;
+    QEMUTimer       *diag_timer;     /* fast NIP/MSR/DEC sampler */
     PowerPCCPU      *cpu;
     bool             ic_pending;     /* legacy: SLT1 timer pending */
     bool             ic_fec_pending; /* FEC peripheral interrupt pending */
@@ -241,6 +242,161 @@ static void mpc5200_apply_keyswitch_patches(void)
             "MPC5200: applied CT296 KeySwitch bypass patches at 0x12d390 "
             "and 0x12ae60\n");
     fflush(stderr);
+}
+
+/*
+ * Fast diagnostic NIP/MSR/DEC sampler. Fires every 100 us of virtual
+ * time for the first 100 ms of guest run, then disables itself.
+ * Detects when the CPU passes through known boot stations (usrRoot
+ * candidates in the bootrom) and logs the first hit on each, plus
+ * MSR and DEC SPR snapshots. Independent from the 60 Hz SLT tick.
+ */
+typedef struct {
+    target_ulong addr;
+    target_ulong addr_end;
+    const char  *name;
+    bool         hit;
+    target_ulong highest_nip;  /* highest NIP observed within the range */
+} BootStation;
+
+static BootStation g_boot_stations[] = {
+    /* === outer boot path === */
+    { 0x010d8718, 0x010d8807, "usrInit",                                false, 0 },
+    { 0x010f2154, 0x010f272f, "excVecInit",                             false, 0 },
+    { 0x010f1ff0, 0x010f2153, "excConnectVector helper",                false, 0 },
+    { 0x010f2730, 0x010f27f7, "excConnect",                             false, 0 },
+    { 0x010f27f8, 0x010f29ff, "excIntConnect",                          false, 0 },
+    { 0x010e0b60, 0x010e9e5b, "sysHwInit (large -- includes callees)", false, 0 },
+    { 0x010e9e5c, 0x010ea0ff, "sysSdmaInit",                            false, 0 },
+    { 0x010ddfec, 0x010de103, "sysSerialHwInit",                        false, 0 },
+    { 0x010de104, 0x010de597, "sysSerialHwInit2",                       false, 0 },
+    { 0x010dc1a0, 0x010dc7e7, "m5200IntrInit",                          false, 0 },
+    { 0x010dc7e8, 0x010dca17, "sysGpioHwInit",                          false, 0 },
+    { 0x010e0abc, 0x010e0b5f, "sysCpuCheck",                            false, 0 },
+
+    /* === usrKernelInit and the library-init functions it calls === */
+    { 0x010d4e54, 0x010d6047, "usrKernelInit (full body)",              false, 0 },
+    { 0x010c8a18, 0x010cbcbf, "taskLibInit",                            false, 0 },
+    { 0x010adacc, 0x010b49ff, "taskHookInit",                           false, 0 },
+    { 0x010c5480, 0x010c5ce3, "semBLibInit",                            false, 0 },
+    { 0x010c5ce4, 0x010c71a3, "semCLibInit",                            false, 0 },
+    { 0x010c71a4, 0x010c8a17, "semMLibInit",                            false, 0 },
+    { 0x010cbcc0, 0x010ce1f7, "wdLibInit",                              false, 0 },
+    { 0x010c358c, 0x010c547f, "msgQLibInit",                            false, 0 },
+    { 0x010b4d68, 0x010b523f, "qInit",                                  false, 0 },
+    { 0x010ce1f8, 0x010d31e7, "workQInit",                              false, 0 },
+    { 0x010a7fc0, 0x010a896b, "memInit (in memPartLib)",                false, 0 },
+    { 0x010a896c, 0x010adacb, "memPartLibInit",                         false, 0 },
+    { 0x010a1bac, 0x010a1bcb, "cacheLibInit",                           false, 0 },
+    { 0x010a1bcc, 0x010a7fbf, "cacheEnable",                            false, 0 },
+
+    /* === kernel scheduling === */
+    { 0x010c33c8, 0x010c358b, "kernelInit",                             false, 0 },
+    { 0x010d3860, 0x010d3aaf, "windLoadContext",                        false, 0 },
+    { 0x010d3640, 0x010d385f, "windExit",                               false, 0 },
+    { 0x010d3690, 0x010d370b, "taskCode",                               false, 0 },
+
+    /* === bootrom usrRoot itself === */
+    { 0x010d60f8, 0x010d6047 + 0x300, "usrRoot",                        false, 0 },
+    { 0x010d6048, 0x010d60f7, "usrMmuInit body",                        false, 0 },
+    { 0x010e08a4, 0x010e0abb, "sysClkConnect body",                     false, 0 },
+    { 0x010e07fc, 0x010e08a3, "sysHwInit2 body",                        false, 0 },
+    { 0x010de5e4, 0x010de7ff, "sysClkRateSet body",                     false, 0 },
+    { 0x010de598, 0x010de5e3, "sysClkEnable body",                      false, 0 },
+    { 0x01038c1c, 0x01038c2b, "vxDecSet -- DEC IS ARMED",               false, 0 },
+    { 0x01038c2c, 0x01038c4b, "vxDecReload (DEC re-arm in ISR)",        false, 0 },
+    { 0x010db170, 0x010db26f, "sysClkInt body (DEC ISR)",               false, 0 },
+
+    /* === vxworks.out runtime stations === */
+    { 0x0011aae0, 0x0011aaff, "VX: sysClkEnable",                       false, 0 },
+    { 0x00207a18, 0x00207a1f, "VX: vxDecSet -- DEC ARMED (runtime)",    false, 0 },
+    { 0x00117fd0, 0x001180ff, "VX: sysClkInt",                          false, 0 },
+};
+
+/* NIP histogram across full bootrom .text — reveals idle loops. */
+#define NIP_HIST_BASE  0x01000000UL
+#define NIP_HIST_END   0x011f4000UL
+#define NIP_HIST_SIZE  ((NIP_HIST_END - NIP_HIST_BASE) / 4)
+static unsigned g_nip_hist[NIP_HIST_SIZE];
+
+static void mpc5200_diag_sample(void *opaque)
+{
+    MPC5200State *s = opaque;
+    static int  diag_count = 0;
+    const int   diag_max   = 30000;  /* 30000 × 100us = 3 s of virtual time */
+    int         i;
+
+    target_ulong nip = s->cpu->env.nip;
+    target_ulong msr = s->cpu->env.msr;
+    target_ulong dec = s->cpu->env.spr[SPR_DECR];
+
+    /* Detect first hit on each boot station */
+    for (i = 0; i < (int)(sizeof(g_boot_stations) / sizeof(g_boot_stations[0]));
+         i++) {
+        BootStation *bs = &g_boot_stations[i];
+        if (!bs->hit && nip >= bs->addr && nip <= bs->addr_end) {
+            bs->hit = true;
+            fprintf(stderr,
+                    "STATION HIT [%2d] @ NIP=0x%08x MSR=0x%08x DEC=0x%08x : %s\n",
+                    i, (unsigned)nip, (unsigned)msr, (unsigned)dec, bs->name);
+            fflush(stderr);
+        }
+    }
+
+    /* Histogram — track samples in the scheduler/dispatch range */
+    if (nip >= NIP_HIST_BASE && nip < NIP_HIST_END) {
+        unsigned idx = (nip - NIP_HIST_BASE) / 4;
+        if (g_nip_hist[idx] < UINT_MAX) {
+            g_nip_hist[idx]++;
+        }
+    }
+
+    if (++diag_count < diag_max) {
+        timer_mod(s->diag_timer,
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 100000ULL); /* 100us */
+    } else {
+        unsigned j;
+        fprintf(stderr,
+                "MPC5200: diag sampler done after %d samples; "
+                "summary of unreached stations:\n", diag_count);
+        for (i = 0; i < (int)(sizeof(g_boot_stations) / sizeof(g_boot_stations[0]));
+             i++) {
+            if (!g_boot_stations[i].hit) {
+                fprintf(stderr, "  UNREACHED [%2d] 0x%08x : %s\n",
+                        i, (unsigned)g_boot_stations[i].addr,
+                        g_boot_stations[i].name);
+            }
+        }
+        /* dump top-30 NIP histogram entries by count */
+        {
+            unsigned top_idx[30] = {0};
+            unsigned top_cnt[30] = {0};
+            unsigned k;
+            for (j = 0; j < NIP_HIST_SIZE; j++) {
+                if (g_nip_hist[j] == 0) continue;
+                /* insertion sort into top_cnt[] */
+                for (k = 0; k < 30; k++) {
+                    if (g_nip_hist[j] > top_cnt[k]) {
+                        unsigned m;
+                        for (m = 29; m > k; m--) {
+                            top_cnt[m] = top_cnt[m-1];
+                            top_idx[m] = top_idx[m-1];
+                        }
+                        top_cnt[k] = g_nip_hist[j];
+                        top_idx[k] = j;
+                        break;
+                    }
+                }
+            }
+            fprintf(stderr, "MPC5200: top-30 NIP histogram entries:\n");
+            for (k = 0; k < 30 && top_cnt[k] > 0; k++) {
+                fprintf(stderr, "  [%2d] 0x%08x : %u samples\n",
+                        k, (unsigned)(NIP_HIST_BASE + top_idx[k] * 4),
+                        top_cnt[k]);
+            }
+        }
+        fflush(stderr);
+    }
 }
 
 static void mpc5200_tick(void *opaque)
@@ -1093,12 +1249,17 @@ static void ppc_core99_init(MachineState *machine)
     mpc5200->bestcomm[0x02] = 0x30;
     mpc5200->bestcomm[0x03] = 0x00;
     mpc5200->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, mpc5200_tick, mpc5200);
+    mpc5200->diag_timer =
+        timer_new_ns(QEMU_CLOCK_VIRTUAL, mpc5200_diag_sample, mpc5200);
     /* delay first tick by 1 s of guest time to let BSP run early init */
     {
         int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
         fprintf(stderr, "MPC5200: init timer, now=%"PRId64"\n", now);
         fflush(stderr);
         timer_mod(mpc5200->timer, now + 1000000000LL);
+        /* Diagnostic sampler runs from boot — no startup delay so we
+         * catch usrRoot in flight before it blocks. */
+        timer_mod(mpc5200->diag_timer, now + 1000ULL);
     }
     memory_region_init_io(&mpc5200->mr, NULL, &mpc5200_mmio_ops, mpc5200,
                           "mpc5200-mmio", 1 * MiB);
