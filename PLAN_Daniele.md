@@ -2,9 +2,9 @@
 
 **Owner:** Daniele
 **Branch:** `mpc5200-diagnosis` off `mpc5200-stub`
-**Time budget:** ~1 day
+**Status:** ✅ COMPLETE — see `BSP_park_findings.md`
 **Touches:** docs only — no code changes
-**Output:** one markdown report at `BSP_park_findings.md` (repo root)
+**Output:** `BSP_park_findings.md` (repo root)
 
 ---
 
@@ -21,42 +21,44 @@ question directly from the binary.
 
 ---
 
-## The questions
+## Findings summary (2026-04-28)
 
-### Primary — what is parked at `0x207fe8`?
+**Verdict: REFUTED** — with corrections that still validate the FEC track.
 
+Full evidence in `BSP_park_findings.md`. Key points:
+
+- **0x207fe8 is not a park address.** It is the `isync` on the fast-exit
+  path of `windExit`. It only appears in SPRG0 (pre-interrupt NIP saved
+  by VxWorks tick handler) — the CPU is not stalled there.
+- **The real idle condition:** the null/idle task runs `windExit` spin
+  loop (0x207f70–0x207fd0), polling `kernelState` at RAM 0x908310. No
+  MMIO is polled. All application tasks are blocked on network completion.
+- **FTP server is 169.254.254.252**, not .253. Address .253 does not
+  appear in the binary.
+- **FTP credentials:** anonymous / `test@cotas.dk`, file `ct6003/vxworks`
+  (or board-variant equivalent).
+- **FEC track still correct.** Once the MPC5200 FEC model delivers
+  packets and the anonymous FTP download completes, `windExit` will find
+  a ready task and the kernel unsticks. No pivot needed.
+- **Cold-start alternative:** bootline `tffs=0,0(0,0)` loads from NAND
+  flash — a TFFS image could bypass the network entirely.
+
+---
+
+## The question
+
+**At NIP `0x207fe8`, what is the BSP actually waiting for?**
+
+Sub-questions:
 1. What memory location or peripheral register is being polled?
 2. Which task (in WIND_TCB sense) is parked, and on what blocker?
 3. If the answer is "FTP push", what protocol exactly — RFC 959, or
    something Vestas-proprietary?
 
-### Secondary — how is `/ata0a/` mounted?
-
-Node 10 files were dumped from a working Røye2 turbine via Firedrake.
-We don't know how VxWorks mounts that filesystem on real hardware —
-need this for Phase 2.5 (actually mounting it in QEMU). May also
-overlap with the primary question: if the kernel parks on a failed FS
-mount rather than an FTP wait, the verdict on `0x207fe8` flips.
-
-Sub-questions:
-1. Which device backs `/ata0a/`? ATA controller (MPC5200 has one),
-   TrueFFS over flash, CompactFlash, or something else?
-2. Which FS type? `dosFs` (FAT-style), `tffsDrv`, raw `iosDevAdd`?
-3. What partition layout does it expect (MBR? FAT16/32? raw block 0)?
-4. What's the call site in the BSP that does the mount? Symbol-search
-   targets: `dosFsDevInit`, `dosFsMkfs`, `usrMmcFsInit`, `ataDrv`,
-   `ataDevCreate`, `tffsDrv`, `usrFdiskPartRead`, `iosDevAdd` calls.
-5. What's the boot-mode vs runmode trigger? Hardware jumper, FS
-   marker file, bootline param, I/O register? If we can force runmode
-   by pre-populating `/ata0a/`, we may sidestep the FTP push entirely.
-
 ---
 
 ## Inputs
 
-- **MPC5200 manual:** `docs/MPC5200_Users_Guide.pdf` (full),
-  `docs/MPC5200_BestComm_Chapter13.pdf`,
-  `docs/MPC5200_FEC_Chapter14.pdf`.
 - **Binary:** `/tmp/vxworks_romfs/vxworks.out` — VxWorks 5.5.1 PowerPC
   ELF, ~14 MB. Symbol table preserved.
 - **Current QEMU state:** `mpc5200-stub` HEAD at commit `9ec6a690fd`.
@@ -128,25 +130,6 @@ If Step 1+2 point at network wait:
 4. If not: best-effort guess (RFC 959 FTP is the Occam's razor answer
    given the APIPA pattern)
 
-### Step 4 — filesystem mount investigation
-
-Independent of the park question, document how `/ata0a/` is brought
-up:
-
-1. Symbol search: `nm vxworks.out | grep -iE
-   "dosfs|tffs|atadrv|atadevcreate|iosdevadd|fdisk"`. Identify which
-   filesystem and device drivers are linked in.
-2. Find the BSP call site that mounts `/ata0a/`. Likely candidates:
-   `usrRoot`, `sysFsBootInit`, or a `sysHwInit2` extension. Walk the
-   call graph from there.
-3. Decode the device-create call: what device descriptor, what
-   partition number, what block size?
-4. Look for the boot-mode vs runmode decision: branch on a hardware
-   reg, a bootline string, or a marker file presence. Document the
-   trigger.
-5. Note the expected directory layout under `/ata0a/`. Compare to the
-   Røye2 dump — does `etc/startup.app` live where the BSP expects?
-
 ---
 
 ## Deliverable
@@ -181,13 +164,6 @@ Write `BSP_park_findings.md` (repo root) with:
 Task name: <e.g. tBootInit>
 Blocked on: <semaphore / message queue / direct poll loop>
 TCB status: 0x<hex>
-
-### Filesystem mount on real hardware
-- Device: <ata0 / tffs0 / other>
-- FS type: <dosFs / tffsDrv / raw / other>
-- Mount call site: <symbol + offset>
-- Boot-mode vs runmode trigger: <jumper / bootline / marker file>
-- Expected layout under `/ata0a/`: <key paths checked at boot>
 
 ### Protocol (if network wait)
 - Standard FTP / TFTP / proprietary
