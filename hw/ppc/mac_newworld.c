@@ -300,6 +300,27 @@ static void mpc5200_tick(void *opaque)
                 tick_count, ext_armed);
         fflush(stderr);
     }
+
+    /*
+     * Diagnostic: every 60 ticks (~1 s), sample NIP and LR. Log if the
+     * CPU is currently executing in the FEC driver region
+     * (0x12c000..0x130000) — that tells us whether m5200FecEndLoad ever
+     * runs and where it diverges.
+     */
+    if ((tick_count % 60) == 0) {
+        target_ulong nip = s->cpu->env.nip;
+        target_ulong lr  = s->cpu->env.lr;
+        if (nip >= 0x12c000 && nip < 0x130000) {
+            fprintf(stderr, "TRACE: NIP=0x%08x LR=0x%08x (in FEC driver)\n",
+                    (unsigned)nip, (unsigned)lr);
+            fflush(stderr);
+        } else if ((tick_count / 60) <= 30) {
+            /* Log NIP for first 30 sample windows to see general activity */
+            fprintf(stderr, "TRACE: NIP=0x%08x LR=0x%08x\n",
+                    (unsigned)nip, (unsigned)lr);
+            fflush(stderr);
+        }
+    }
     s->ic_pending = true;
     if (ext_armed) {
         ppc_set_irq(s->cpu, PPC_INTERRUPT_EXT, 1);
@@ -454,13 +475,16 @@ static void mpc5200_mmio_write(void *opaque, hwaddr offset,
             s->bestcomm[i + k] = v & 0xff;
             v >>= 8;
         }
-        /* Diagnostic: log all BestComm config writes (first ~64). */
+        /* Diagnostic: log all BestComm config writes (first ~64) with caller NIP. */
         {
             static unsigned bc_log = 0;
             if (bc_log++ < 64) {
+                target_ulong nip = s->cpu->env.nip;
+                target_ulong lr  = s->cpu->env.lr;
                 fprintf(stderr,
-                        "BestComm W +0x%03x sz=%u val=0x%08x\n",
-                        (unsigned)offset, size, (unsigned)value);
+                        "BestComm W +0x%03x sz=%u val=0x%08x  NIP=0x%08x LR=0x%08x\n",
+                        (unsigned)offset, size, (unsigned)value,
+                        (unsigned)nip, (unsigned)lr);
                 fflush(stderr);
             }
         }
