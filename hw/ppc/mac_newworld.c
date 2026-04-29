@@ -307,9 +307,20 @@ static void mpc5200_apply_keyswitch_patches(void)
     cpu_physical_memory_write(0x0012d390, nop, 4);
     /* m5200FecRestart: bne- cr7, 0x12aea0 → nop (per agent) */
     cpu_physical_memory_write(0x0012ae60, nop, 4);
+
+    /*
+     * Vestas-app spawn gate. At NIP 0x001009d8 the BSP function 0x00100920
+     * reads *(0x00962e2c); if non-zero, all downstream taskSpawns
+     * (tApMain, tFirecrest, tFiredrake, tNeon, ...) are skipped. Phase 2a
+     * naive force-zero: clobber the BSS slot once at first SLT tick, then
+     * Phase 1a's per-100us watcher will tell us whether BSP code rewrites
+     * it. If it does, we'll escalate to nop'ing 0x001009e0 (Phase 2b).
+     */
+    stl_be_phys(&address_space_memory, 0x00962e2c, 0);
+
     fprintf(stderr,
-            "MPC5200: applied CT296 KeySwitch bypass patches at 0x12d390 "
-            "and 0x12ae60\n");
+            "MPC5200: applied CT296 KeySwitch bypass patches at 0x12d390, "
+            "0x12ae60; force-zeroed app-spawn gate at 0x00962e2c\n");
     fflush(stderr);
 }
 
@@ -399,6 +410,13 @@ static BootStation g_boot_stations[] = {
     { 0x0020b9fc, 0x0020bbd7, "VX: SDMA RX setup body",                 false, 0 },
     { 0x0020b848, 0x0020b9fb, "VX: SDMA common installer",              false, 0 },
     { 0x0020a3b0, 0x0020a5f7, "VX: init_dma_image_TASK_FEC_TX",         false, 0 },
+
+    /* === Vestas-app spawn gate (plan 2026-04-30) === */
+    { 0x00100920, 0x00100923, "VX: gate-fn entry (0x100920)",            false, 0 },
+    { 0x001009d8, 0x001009db, "VX: gate-check load *(0x962e2c)",         false, 0 },
+    { 0x001009e0, 0x001009e3, "VX: gate-check branch (skip if !=0)",     false, 0 },
+    { 0x001009e4, 0x001009ef, "VX: gate-pass (sets *(0x95a5a0)=1)",      false, 0 },
+    { 0x0014adc0, 0x0014adc3, "VX: error-print xref to 0x962e2c",        false, 0 },
 };
 
 /* NIP histogram across full bootrom .text — reveals idle loops. */
@@ -469,6 +487,35 @@ static void mpc5200_diag_sample(void *opaque)
                     "BSP: *(0x90851C) (SDMA base?) = 0x%08x\n", sdma_base);
             fflush(stderr);
             last_sdma_base = sdma_base;
+        }
+    }
+
+    /*
+     * Vestas-app spawn-gate watcher (plan 2026-04-30, Phase 1a Option A).
+     * Logs every change to *(0x00962e2c) (gate input) and *(0x0095a5a0)
+     * (Vestas-mode flag set when gate passes). Sentinel 0xDEADBEEF means
+     * "not observed yet".
+     */
+    {
+        static uint32_t last_gate    = 0xDEADBEEF;
+        static uint32_t last_apmode  = 0xDEADBEEF;
+        uint32_t gate_val   = ldl_be_phys(&address_space_memory, 0x00962e2c);
+        uint32_t apmode_val = ldl_be_phys(&address_space_memory, 0x0095a5a0);
+        if (gate_val != last_gate) {
+            fprintf(stderr,
+                    "GATE: *(0x00962e2c) %s 0x%08x at NIP=0x%08x\n",
+                    last_gate == 0xDEADBEEF ? "init" : "->",
+                    gate_val, (unsigned)nip);
+            fflush(stderr);
+            last_gate = gate_val;
+        }
+        if (apmode_val != last_apmode) {
+            fprintf(stderr,
+                    "GATE: *(0x0095a5a0) %s 0x%08x at NIP=0x%08x  (Vestas-mode flag)\n",
+                    last_apmode == 0xDEADBEEF ? "init" : "->",
+                    apmode_val, (unsigned)nip);
+            fflush(stderr);
+            last_apmode = apmode_val;
         }
     }
 
