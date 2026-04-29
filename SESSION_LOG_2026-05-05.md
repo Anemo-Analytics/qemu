@@ -238,46 +238,71 @@ enhanced SDMA eval diagnostic.
   per-source flags, NIP (Phase 1.X diagnostic — invaluable for
   future debug).
 
-## Next session plan — pivot
+## Next session plan — QEMU-internal paths only
 
-QEMU dispatch hunt has yielded enough information to decide.
-Three dispatch experiments ruled out, MSR.EE=0 confirmed as the
-wall. Two paths from here:
+Three dispatch experiments ruled out (mask, edge re-trigger,
+SLT1 drop). MSR.EE=0 hold confirmed as the wall. Several
+QEMU-internal options exist, ranked by promise:
 
-### Path A — Phase 2.B (BSP-side semGive shim)
+### A — Phase 2.B (BSP-side semGive shim) — RECOMMENDED
 
-Install a one-shot patch on SLT1 tick callback (or some periodic
-BSP code site) that, when triggered by a flag we set, calls the
+Install a one-shot patch on a periodic BSP code site (SLT1 tick
+callback, sysClkInt tail, or similar that runs in kernel
+context with the right scheduler invariants) that, when
+triggered by a flag we set in the QEMU IO thread, calls the
 BSP's own `semGive(0x07bee080)`. Doorbell scaffolding already
-exists at `FSHOOK_OFFSET`. Per agent 2's review, **don't try
-direct sem-poke** — VxWorks `SEM_OBJ` layout assumed in the plan
+exists at `FSHOOK_OFFSET`.
+
+Per agent 2's review, **don't try direct sem-poke from QEMU
+side** — VxWorks `SEM_OBJ` layout assumed in the original plan
 was wrong (magic at +0 is a class pointer, not ASCII tag; Q_HEAD
-is 16 bytes; ready-queue invariants are extensive). BSP's own
-kernel must do the give.
+is 16 bytes; ready-queue invariants are extensive — `taskIdReady`,
+`readyQBmap`, etc.). BSP's own kernel must do the give.
 
-First step (per agent 2): no-code-change run that dumps 64 bytes
-at `0x07bee080` + 2 other sems for layout comparison. **Only
-after that** decide between approaches.
+First step (per agent 2): zero-code-change run that dumps 64
+bytes at `0x07bee080` + 2 other sems (e.g. `tNetTask`'s
+`0x00980a48`) for layout comparison. Identify class pointer,
+Q_HEAD offset, state byte. **Only then** decide patch site.
 
-Estimated time-to-first-RX-wake: 1-2 sessions.
+Estimated: 1-2 sessions to first verified `tFecEndRx` wake.
 
-### Path B — strategic pivot to Python responder (agent 3's recommendation)
+### B — Patch tFecEndRecover so tFecEndRx survives
 
-`/home/kasper/WindowsVMDeploy/Builds/v2_vmp6000_simulator/ap_server.py`
-already exists. Toolkit cares about XML responses on AP/Firedrake/
-FTP ports, not what's behind the wire. Use the existing
-`AP_PROTOCOL_REFERENCE.md` (1622 lines) + 14 turbine PCAPs +
-existing simulator to drive the toolkit through gates 10-12.
-QEMU becomes a witness for protocol correctness rather than the
-production path.
+Side issue from this session: `tFecEndRecover` (PEND+TO with
+~14s timeout) wakes at t≈15s and runs `m5200FecRestart`,
+which **kills `tFecEndRx`**. Even if we get a wake mechanism
+working, by t=20s there's no task to wake. NOP out the
+tFecEndRecover timer or the kill path. Cheap, complementary
+to A.
 
-Estimated time-to-software-load demo: 2-4 weeks (vs. 3-6 months
-on QEMU path with same blockers).
+### C — Force MSR.EE=1 transition from QEMU side
 
-### Recommendation
+Invasive: in the RX hook, after the SDMA RAISE, directly poke
+`s->cpu->env.msr |= MSR_EE` and call `ppc_maybe_interrupt(env)`.
+Forces the dispatch to re-evaluate with EE=1. Risk: violates
+VxWorks's intLock invariant (BSP set EE=0 for a reason).
+Could corrupt scheduler state. Try only if A fails.
 
-Path B is strategically right. Path A is one more "make tFecEndRx
-wake" attempt that might unblock gate 9 but doesn't shorten the
-path to gate 12. Doing both in parallel is fine if there's a
-specific Python-responder gap that needs QEMU validation, but
-QEMU shouldn't be the critical path anymore.
+### D — Find the EE=0 holder and patch it
+
+CPU sits at NIP=0x145430 with EE=0 across the SDMA-pending
+window. That's an `intLock`'d region. Disasm 0x145430,
+identify what's holding it. Could be `windExit`, `taskLock`,
+or a recovery path. Patch the EE-clear so EE stays 1.
+Higher-stakes but architecturally cleanest.
+
+### Recommended order
+
+1. **A first.** semGive shim sidesteps the EE=0 problem
+   entirely without touching delicate kernel internals.
+   Highest probability of unblocking gate 9.
+2. **B alongside A** — cheap insurance that the wake target
+   doesn't get murdered before we wake it.
+3. C and D are escalation paths if A doesn't work, in that
+   order of risk.
+
+Strategic note: even after gate 9 closes, gates 10-12 (toolkit
+acceptance + software-load) are the actual long pole. Each
+session should aim to make a downstream blocker visible
+(socket layer wakeup, TX BD walk on reply, daemon-specific
+protocol handler) — not just to wake the current PEND'd task.
