@@ -24,17 +24,27 @@ verifies.
 | **1** | Stable scheduler, no exception loops | `-d int` shows only `DECR`/`EXTERNAL`, never `HV_EMU` or `PROGRAM` | `grep -oE "=> [A-Z_]+" /tmp/qemu_int.txt \| sort \| uniq -c` | ✅ |
 | **2** | BSP reaches FEC init | FEC register writes show up — ECR reset, MAC programmed, MII clock divider, MII frame issued | grep `^FEC W` in QEMU log | ✅ (this session) |
 | **3** | BestComm executor — TX | When BSP enables TCR[2]=0xC2, our executor walks the BD ring and `qemu_send_packet`s the frame | Wireshark/tcpdump on host loopback shows guest-originated TCP SYN to 169.254.254.252:21 | ✅ TX walker works; ARP frame on wire |
-| **4** | BestComm executor — RX | Inbound frame's BD copy + EIR.RXF + SDMA RX IRQ delivered to BSP | host-injected frame → `BestComm RX:` log + `tFecEndRx` unblocks | 🟡 infra wired (RX walker, SDMA IRQ math, IntMask gating verified by code review). **NOT exercised** — slirp doesn't initiate traffic to the guest |
+| **4** | BestComm executor — RX | Inbound frame's BD copy + EIR.RXF + SDMA RX IRQ delivered to BSP | host-injected frame → `BestComm RX:` log + `tFecEndRx` unblocks | ✅ **closed 2026-04-30.** With `hostfwd` plumbing in `run.sh`, host-side `nc` to forwarded ports triggers RX walker repeatedly — `BestComm RX:` walks the full BD ring (0x9600 → 0x9638). |
 | **5** | ~~FTP boot completes~~ | superseded — this BSP image doesn't *try* to FTP-boot from `.252` | n/a | ⚠️ **bypassed, not achieved.** BSP runs without an FS image being pulled. Whether it had a usable FS or not is unknown |
 | **6** | First serial banner | Vestas app emits banner on PSC | `PSC_TX[…]: Wind World ...` log line | ❌ **not achieved.** No PSC TX observed — Vestas app isn't running |
-| **7** | Filesystem available | `/ata0a/` mounted, `etc/startup.app` found | `iosDevShow` lists `/ata0a/` | ❓ **unverified.** Service daemons spawned ≠ FS mounted. We have zero direct evidence |
-| **8** | Vestas application boots | `startup.app` runs, `tApMain`/`tFirecrest`/`tFiredrake` appear | task list contains those names, banner emitted | ❌ **NOT achieved.** Task list contains 21 tasks — all VxWorks system / generic daemons. **Zero Vestas-app tasks** |
-| **9** | Network listener up | Vestas app opens AP / Firecrest / Firedrake ports | `nmap -p 8080,9482,...` from host shows listening ports | ❓ **unverified.** Generic `tFtpdTask`/`tNfsd` are spawned but we have NOT confirmed any port is actually bound + reachable. Host can't reach guest with current `-nic user` config |
+| **7** | Filesystem available | **`/fs/` mounted, `/fs/etc/startup.app` loadable** | BSP doesn't print "Cannot find startup.app in runmode !" | ❌ **identified as the real bottleneck 2026-04-30.** BSP looks for `/fs/etc/startup.app`; after 8 failures it drops to bootmode, which is exactly the idle-daemon state we see. Also: the Vestas-app task names (`tApMain`, `tFirecrest`, `tFiredrake`, `tNeon`) **do not exist as strings in `vxworks.out`** — they are spawned by the startup script, not the BSP itself. See `BSP_app_spawn_gate_findings.md`. |
+| **8** | Vestas application boots | `startup.app` runs, `tApMain`/`tFirecrest`/`tFiredrake` appear | task list contains those names, banner emitted | ❌ **NOT achieved.** Task list contains 21 tasks — all VxWorks system / generic daemons. **Zero Vestas-app tasks.** Now known to cascade from gate 7 (FS missing). |
+| **9** | Network listener up | Vestas app opens AP / Firecrest / Firedrake ports | `nmap -p 8080,9482,...` from host shows listening ports | 🟡 **partially advanced 2026-04-30.** Generic VxWorks daemons confirmed listening: FTP (21), portmap (111), NFS (2049) all accept TCP handshake from host via `nc` over `hostfwd`. **AP / Firecrest / Firedrake ports still NOT verified** — those belong to the Vestas app which isn't running. |
 | **10** | Toolkit recognizes turbine | VMP6000 Toolkit lists our QEMU under "available turbines" with the right board ID | Toolkit UI screenshot showing CT6003_Motherboard_V3 entry | ⏳ |
 | **11** | Toolkit reads parameters | Toolkit reads a parameter (e.g. RatedPower) and gets a plausible value | Toolkit UI shows non-zero value, not "comm error" | ⏳ |
 | **12** | **Toolkit performs software load** | Toolkit pushes a firmware/binary file via Firedrake/AP and the turbine accepts it | Toolkit UI shows "load successful" + QEMU logs the FTP/Firedrake receive | ⏳ **END GOAL** |
 
-### Where we are (honest): gate 3 cleared. Gate 4 wired but unexercised. Gates 5-9 NOT achieved.
+### Where we are (honest): gates 3+4 cleared. Gate 9 partially (VxWorks side). Gates 5-8 NOT achieved.
+
+**2026-04-30 update:** gate 4 closed via `nc` probes against
+`hostfwd`'d ports — RX walker fires on real inbound traffic. Gate 9
+half-closed: 3 of 4 standard VxWorks daemons (FTP, portmap, NFS) are
+bound + reachable. The Vestas-app-specific listeners (AP, Firecrest,
+Firedrake) still don't exist because the app doesn't spawn — a
+candidate gate at `*(0x00962e2c)` was investigated and ruled out (BSS
+already zero from boot, gate-fn at `0x00100920` never called). Real
+Vestas-app spawn gate hunt in progress — see
+`SESSION_LOG_2026-04-30.md`.
 
 Rough progress to gate 12: **~20-25%.** We have the hardware
 emulation (gates 0-3) plus a kernel that boots into a non-app idle
