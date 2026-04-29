@@ -90,6 +90,44 @@ void mpc5200_fec_send_packet(DeviceState *dev, const uint8_t *buf, size_t len);
 #include "trace.h"
 
 /*
+ * FS-hook hypercall MMIO doorbell at MBAR+0x4000 (Phase 4b, 2026-05-02).
+ *
+ * The BSP's open/read/close wrappers (vxworks 0x2b13c8 / 0x2b18fc / 0x2b17d4)
+ * are patched into 9-instruction stubs that write the args into our doorbell
+ * and trigger a host-syscall dispatcher here. Real `/fs/<tail>` traffic is
+ * proxied to a host directory; everything else is rejected.
+ */
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <errno.h>
+
+#define FSHOOK_OFFSET        0x4000   /* MBAR+0x4000..0x401F doorbell */
+#define FSHOOK_REG_SIZE      0x20
+
+/* Doorbell layout: cmd@0, arg0@4, arg1@8, arg2@C, result@10, errno@14. */
+#define FSHOOK_REG_CMD       0x00
+#define FSHOOK_REG_ARG0      0x04
+#define FSHOOK_REG_ARG1      0x08
+#define FSHOOK_REG_ARG2      0x0C
+#define FSHOOK_REG_RESULT    0x10
+#define FSHOOK_REG_ERRNO     0x14
+/* Diagnostic: write a guest path-pointer here to log "TRACE: <path>" without
+ * triggering any host syscall. Used to verify that an instrumented BSP site
+ * is actually being executed (e.g. the 0x13ffe4 existence-check stub). */
+#define FSHOOK_REG_TRACE     0x18
+
+/* Command IDs — match the BSP-side stubs in mpc5200_apply_keyswitch_patches. */
+#define FS_OPEN   1
+#define FS_READ   2
+#define FS_CLOSE  3
+#define FS_LSEEK  4
+#define FS_FSTAT  5
+
+#define FSHOOK_NUM_FDS       16
+#define FSHOOK_FAKE_FD_BASE  1000  /* fake fds returned to BSP: 1000..1015 */
+
+/*
  * Minimal MPC5200 MMIO stub for VxWorks BSP emulation.
  *
  * I2C2 registers at MBAR+0x3d40:
@@ -178,6 +216,19 @@ typedef struct {
      * we leave them to the fall-through unimplemented stub.
      */
     uint8_t          sram[0x4000];
+    /*
+     * FS-hook hypercall state (Phase 4b). Doorbell registers + a small
+     * proxy table mapping fake VxWorks fds (1000+i) back to host fds.
+     */
+    struct {
+        uint32_t arg0, arg1, arg2;
+        uint32_t result;
+        uint32_t err;
+        struct {
+            int  host_fd;
+            bool in_use;
+        } fd_proxy[FSHOOK_NUM_FDS];
+    } fshook;
 } MPC5200State;
 
 static void mpc5200_i2c2_init(MPC5200I2CState *i2c)
@@ -300,6 +351,9 @@ static void mpc5200_fec_irq_handler(void *opaque, int n, int level)
  * time the loader has put the ELF into RAM but the BSP may not yet
  * have hit the patch sites.
  */
+/* Forward decl: fshook_root() body lives near the MMIO read/write callbacks. */
+static const char *fshook_root(void);
+
 static void mpc5200_apply_keyswitch_patches(void)
 {
     /* m5200FecStart: beq cr7, 0x12d7e8 → nop */
@@ -354,16 +408,71 @@ static void mpc5200_apply_keyswitch_patches(void)
      *
      * The function never set up its stack frame yet, so a bare blr is safe.
      */
-    static const uint8_t fs_exists_stub[8] = {
-        0x38, 0x60, 0x00, 0x01,   /* li   r3, 1     */
-        0x4e, 0x80, 0x00, 0x20,   /* blr            */
+    /* fs_exists stub now traces through the FS-hook doorbell so we know
+     * when (and with what path) the existence helper actually fires. The
+     * existing real body at 0x13ffe4 is 9 instructions (36 bytes) — same
+     * size as our hypercall stubs — so we have room. */
+    static const uint8_t fs_exists_stub[24] = {
+        0x3d, 0x80, 0xf0, 0x00,   /* lis  r12, 0xF000              */
+        0x61, 0x8c, 0x40, 0x18,   /* ori  r12, r12, 0x4018         */
+        0x90, 0x6c, 0x00, 0x00,   /* stw  r3, 0(r12)  -> TRACE     */
+        0x38, 0x60, 0x00, 0x01,   /* li   r3, 1                    */
+        0x4e, 0x80, 0x00, 0x20,   /* blr                            */
+        0x60, 0x00, 0x00, 0x00,   /* nop (pad)                      */
     };
-    cpu_physical_memory_write(0x0013ffe4, fs_exists_stub, 8);
+    cpu_physical_memory_write(0x0013ffe4, fs_exists_stub, sizeof(fs_exists_stub));
+
+    /*
+     * Phase 4b (2026-05-02): hypercall stubs at the BSP's open/read/close
+     * entry points. Each replaces the native VxWorks wrapper with 9 PPC
+     * instructions (36 bytes) that write args to the FS-hook MMIO doorbell
+     * at 0xF0004000 and read the result back into r3.
+     *
+     *   3D 80 F0 00   lis  r12, 0xF000
+     *   61 8C 40 00   ori  r12, r12, 0x4000      ; r12 = 0xF0004000
+     *   90 6C 00 04   stw  r3, 4(r12)              ; arg0
+     *   90 8C 00 08   stw  r4, 8(r12)              ; arg1
+     *   90 AC 00 0C   stw  r5, 12(r12)             ; arg2
+     *   38 00 00 0X   li   r0, <FS_*>
+     *   90 0C 00 00   stw  r0, 0(r12)              ; cmd: trigger handler
+     *   80 6C 00 10   lwz  r3, 16(r12)             ; result -> r3
+     *   4E 80 00 20   blr
+     *
+     * r0/r12 are PPC ABI volatile (caller-saved) — safe scratch. LR is
+     * unchanged so blr returns to the original caller.
+     *
+     * Entry points (verified Phase A from monodis + symtab @ file 0x7f60xx):
+     *   open  = 0x002b13c8  (wraps 0x2b13ec -> iosOpen 0x2b2d9c)
+     *   read  = 0x002b18fc  (wraps iosRead  0x2b2f00)
+     *   close = 0x002b17d4  (wraps iosClose 0x2b2df0)
+     */
+    {
+        uint8_t stub[36] = {
+            0x3d, 0x80, 0xf0, 0x00,   /* lis  r12, 0xF000              */
+            0x61, 0x8c, 0x40, 0x00,   /* ori  r12, r12, 0x4000         */
+            0x90, 0x6c, 0x00, 0x04,   /* stw  r3, 4(r12)               */
+            0x90, 0x8c, 0x00, 0x08,   /* stw  r4, 8(r12)               */
+            0x90, 0xac, 0x00, 0x0c,   /* stw  r5, 12(r12)              */
+            0x38, 0x00, 0x00, 0x00,   /* li   r0, cmd  (patched)       */
+            0x90, 0x0c, 0x00, 0x00,   /* stw  r0, 0(r12)  -> trigger   */
+            0x80, 0x6c, 0x00, 0x10,   /* lwz  r3, 16(r12)              */
+            0x4e, 0x80, 0x00, 0x20,   /* blr                            */
+        };
+        stub[23] = FS_OPEN;
+        cpu_physical_memory_write(0x002b13c8, stub, sizeof(stub));
+        stub[23] = FS_READ;
+        cpu_physical_memory_write(0x002b18fc, stub, sizeof(stub));
+        stub[23] = FS_CLOSE;
+        cpu_physical_memory_write(0x002b17d4, stub, sizeof(stub));
+    }
 
     fprintf(stderr,
             "MPC5200: applied CT296 KeySwitch bypass patches at 0x12d390, "
             "0x12ae60; force-zeroed app-spawn gate at 0x00962e2c; "
-            "stubbed /fs/etc/startup.app existence check at 0x13ffe4\n");
+            "stubbed /fs/etc/startup.app existence check at 0x13ffe4; "
+            "installed FS-hook hypercall stubs at open=0x2b13c8 "
+            "read=0x2b18fc close=0x2b17d4 (doorbell @ 0xF0004000, root=%s)\n",
+            fshook_root());
     fflush(stderr);
 }
 
@@ -910,6 +1019,261 @@ static void mpc5200_tick(void *opaque)
               qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 16666667ULL); /* ~60 Hz */
 }
 
+/* === FS-hook host-side helpers (Phase 4b) === */
+
+static const char *fshook_root(void)
+{
+    static const char *cached;
+    if (!cached) {
+        const char *env = getenv("MPC5200_FS_ROOT");
+        cached = env ? env :
+            "/home/kasper/Vestas/bin/data_dump/firedrake/turbine_dump_node10_roye2/fs";
+    }
+    return cached;
+}
+
+/* Read a NUL-terminated guest string from physical memory. Returns false on
+ * truncation (caller's buffer too small). */
+static bool fshook_read_guest_path(uint32_t guest_va, char *out, size_t cap)
+{
+    if (cap == 0) {
+        return false;
+    }
+    for (size_t i = 0; i < cap; i++) {
+        uint8_t b = 0;
+        cpu_physical_memory_read(guest_va + i, &b, 1);
+        out[i] = (char)b;
+        if (b == 0) {
+            return true;
+        }
+    }
+    out[cap - 1] = 0;
+    return false;
+}
+
+/* Translate "/fs" or "/fs/..." -> "<root>" or "<root>/...". Reject anything
+ * else so non-/fs/ paths fail like a real "no FS mounted" environment. */
+static bool fshook_translate(const char *vx, char *host, size_t cap)
+{
+    if (vx[0] != '/' || vx[1] != 'f' || vx[2] != 's') {
+        return false;
+    }
+    if (vx[3] != '\0' && vx[3] != '/') {
+        return false;
+    }
+    int n = snprintf(host, cap, "%s%s", fshook_root(), vx + 3);
+    return n > 0 && (size_t)n < cap;
+}
+
+static int fshook_alloc_slot(MPC5200State *s)
+{
+    for (int i = 0; i < FSHOOK_NUM_FDS; i++) {
+        if (!s->fshook.fd_proxy[i].in_use) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static int fshook_lookup_slot(MPC5200State *s, uint32_t fake_fd)
+{
+    if (fake_fd < FSHOOK_FAKE_FD_BASE) {
+        return -1;
+    }
+    int i = (int)(fake_fd - FSHOOK_FAKE_FD_BASE);
+    if (i >= FSHOOK_NUM_FDS) {
+        return -1;
+    }
+    if (!s->fshook.fd_proxy[i].in_use) {
+        return -1;
+    }
+    return i;
+}
+
+static void fshook_handle_open(MPC5200State *s)
+{
+    char vx_path[256];
+    char host_path[512];
+
+    if (!fshook_read_guest_path(s->fshook.arg0, vx_path, sizeof(vx_path))) {
+        s->fshook.result = (uint32_t)-1;
+        s->fshook.err    = EINVAL;
+        fprintf(stderr, "FS_HOOK: open(<bad ptr 0x%08x>) -> -1\n",
+                s->fshook.arg0);
+        fflush(stderr);
+        return;
+    }
+    if (!fshook_translate(vx_path, host_path, sizeof(host_path))) {
+        s->fshook.result = (uint32_t)-1;
+        s->fshook.err    = ENOENT;
+        fprintf(stderr,
+                "FS_HOOK: open(\"%s\") -> -1 (path not under /fs/)\n",
+                vx_path);
+        fflush(stderr);
+        return;
+    }
+    int slot = fshook_alloc_slot(s);
+    if (slot < 0) {
+        s->fshook.result = (uint32_t)-1;
+        s->fshook.err    = EMFILE;
+        fprintf(stderr, "FS_HOOK: open(\"%s\") -> -1 (no free slot)\n",
+                vx_path);
+        fflush(stderr);
+        return;
+    }
+    int hfd = open(host_path, O_RDONLY);
+    if (hfd < 0) {
+        int saved = errno;
+        s->fshook.result = (uint32_t)-1;
+        s->fshook.err    = saved;
+        fprintf(stderr,
+                "FS_HOOK: open(\"%s\") -> -1 (host \"%s\": %s)\n",
+                vx_path, host_path, strerror(saved));
+        fflush(stderr);
+        return;
+    }
+    s->fshook.fd_proxy[slot].host_fd = hfd;
+    s->fshook.fd_proxy[slot].in_use  = true;
+    uint32_t fake = FSHOOK_FAKE_FD_BASE + slot;
+    s->fshook.result = fake;
+    s->fshook.err    = 0;
+    fprintf(stderr,
+            "FS_HOOK: open(\"%s\") -> fake_fd=%u host_fd=%d  (host=\"%s\")\n",
+            vx_path, fake, hfd, host_path);
+    fflush(stderr);
+}
+
+static void fshook_handle_read(MPC5200State *s)
+{
+    uint32_t fake_fd = s->fshook.arg0;
+    uint32_t buf_va  = s->fshook.arg1;
+    uint32_t n       = s->fshook.arg2;
+    int slot = fshook_lookup_slot(s, fake_fd);
+    if (slot < 0) {
+        s->fshook.result = (uint32_t)-1;
+        s->fshook.err    = EBADF;
+        fprintf(stderr, "FS_HOOK: read(fd=%u, ...) -> -1 (not our fd)\n",
+                fake_fd);
+        fflush(stderr);
+        return;
+    }
+    if (n > 4096) {
+        n = 4096;     /* host-side cap; BSP can re-call for more */
+    }
+    uint8_t buf[4096];
+    ssize_t got = read(s->fshook.fd_proxy[slot].host_fd, buf, n);
+    if (got < 0) {
+        int saved = errno;
+        s->fshook.result = (uint32_t)-1;
+        s->fshook.err    = saved;
+        fprintf(stderr, "FS_HOOK: read(fd=%u, n=%u) -> -1 (%s)\n",
+                fake_fd, n, strerror(saved));
+        fflush(stderr);
+        return;
+    }
+    if (got > 0) {
+        cpu_physical_memory_write(buf_va, buf, got);
+    }
+    s->fshook.result = (uint32_t)got;
+    s->fshook.err    = 0;
+    fprintf(stderr,
+            "FS_HOOK: read(fd=%u, buf=0x%08x, n=%u) -> %zd\n",
+            fake_fd, buf_va, n, got);
+    fflush(stderr);
+}
+
+static void fshook_handle_close(MPC5200State *s)
+{
+    uint32_t fake_fd = s->fshook.arg0;
+    int slot = fshook_lookup_slot(s, fake_fd);
+    if (slot < 0) {
+        s->fshook.result = (uint32_t)-1;
+        s->fshook.err    = EBADF;
+        fprintf(stderr, "FS_HOOK: close(fd=%u) -> -1 (not our fd)\n",
+                fake_fd);
+        fflush(stderr);
+        return;
+    }
+    int hfd = s->fshook.fd_proxy[slot].host_fd;
+    int rc = close(hfd);
+    int saved = errno;
+    s->fshook.fd_proxy[slot].in_use  = false;
+    s->fshook.fd_proxy[slot].host_fd = -1;
+    s->fshook.result = (rc == 0) ? 0 : (uint32_t)-1;
+    s->fshook.err    = (rc == 0) ? 0 : saved;
+    fprintf(stderr, "FS_HOOK: close(fd=%u host_fd=%d) -> %d\n",
+            fake_fd, hfd, rc);
+    fflush(stderr);
+}
+
+static void fshook_handle_lseek(MPC5200State *s)
+{
+    uint32_t fake_fd = s->fshook.arg0;
+    int32_t  off     = (int32_t)s->fshook.arg1;
+    uint32_t whence  = s->fshook.arg2;
+    int slot = fshook_lookup_slot(s, fake_fd);
+    if (slot < 0) {
+        s->fshook.result = (uint32_t)-1;
+        s->fshook.err    = EBADF;
+        return;
+    }
+    off_t pos = lseek(s->fshook.fd_proxy[slot].host_fd, off, whence);
+    if (pos < 0) {
+        s->fshook.result = (uint32_t)-1;
+        s->fshook.err    = errno;
+    } else {
+        s->fshook.result = (uint32_t)pos;
+        s->fshook.err    = 0;
+    }
+    fprintf(stderr, "FS_HOOK: lseek(fd=%u, off=%d, w=%u) -> %lld\n",
+            fake_fd, off, whence, (long long)pos);
+    fflush(stderr);
+}
+
+/* Stub fstat: writes only st_size into the guest stat buffer. VxWorks 5.5
+ * struct stat layout puts st_size at offset 0x20; rest left undisturbed
+ * (callers must zero-init beforehand or accept stale fields). */
+static void fshook_handle_fstat(MPC5200State *s)
+{
+    uint32_t fake_fd = s->fshook.arg0;
+    uint32_t out_va  = s->fshook.arg1;
+    int slot = fshook_lookup_slot(s, fake_fd);
+    if (slot < 0) {
+        s->fshook.result = (uint32_t)-1;
+        s->fshook.err    = EBADF;
+        return;
+    }
+    struct stat st;
+    if (fstat(s->fshook.fd_proxy[slot].host_fd, &st) < 0) {
+        s->fshook.result = (uint32_t)-1;
+        s->fshook.err    = errno;
+        return;
+    }
+    stl_be_phys(&address_space_memory, out_va + 0x20, (uint32_t)st.st_size);
+    s->fshook.result = 0;
+    s->fshook.err    = 0;
+    fprintf(stderr, "FS_HOOK: fstat(fd=%u) -> size=%u\n",
+            fake_fd, (uint32_t)st.st_size);
+    fflush(stderr);
+}
+
+static void fshook_dispatch(MPC5200State *s, uint32_t cmd)
+{
+    switch (cmd) {
+    case FS_OPEN:  fshook_handle_open(s);  return;
+    case FS_READ:  fshook_handle_read(s);  return;
+    case FS_CLOSE: fshook_handle_close(s); return;
+    case FS_LSEEK: fshook_handle_lseek(s); return;
+    case FS_FSTAT: fshook_handle_fstat(s); return;
+    default:
+        s->fshook.result = (uint32_t)-1;
+        s->fshook.err    = ENOSYS;
+        fprintf(stderr, "FS_HOOK: unknown cmd=%u\n", cmd);
+        fflush(stderr);
+        return;
+    }
+}
+
 /* Log MMIO accesses outside well-known ranges to help trace kernel behavior */
 static void mpc5200_log_access(const char *rw, hwaddr offset, uint64_t val, unsigned size)
 {
@@ -928,6 +1292,18 @@ static void mpc5200_log_access(const char *rw, hwaddr offset, uint64_t val, unsi
 static uint64_t mpc5200_mmio_read(void *opaque, hwaddr offset, unsigned size)
 {
     MPC5200State *s = opaque;
+
+    /* FS-hook doorbell read-back (Phase 4b): result/errno only. */
+    if (offset >= FSHOOK_OFFSET && offset < FSHOOK_OFFSET + FSHOOK_REG_SIZE) {
+        switch (offset - FSHOOK_OFFSET) {
+        case FSHOOK_REG_RESULT: return s->fshook.result;
+        case FSHOOK_REG_ERRNO:  return s->fshook.err;
+        case FSHOOK_REG_ARG0:   return s->fshook.arg0;
+        case FSHOOK_REG_ARG1:   return s->fshook.arg1;
+        case FSHOOK_REG_ARG2:   return s->fshook.arg2;
+        default:                return 0;
+        }
+    }
 
     /*
      * IC: 0x508 — Peripheral Priority and HI/LO Select 2 (per manual).
@@ -1331,6 +1707,33 @@ static void mpc5200_mmio_write(void *opaque, hwaddr offset,
                                uint64_t value, unsigned size)
 {
     MPC5200State *s = opaque;
+
+    /* FS-hook doorbell write (Phase 4b): writing to REG_CMD triggers the
+     * dispatcher; arg/result/errno slots are plain storage. */
+    if (offset >= FSHOOK_OFFSET && offset < FSHOOK_OFFSET + FSHOOK_REG_SIZE) {
+        uint32_t v = (uint32_t)value;
+        switch (offset - FSHOOK_OFFSET) {
+        case FSHOOK_REG_CMD:    fshook_dispatch(s, v); return;
+        case FSHOOK_REG_ARG0:   s->fshook.arg0   = v;  return;
+        case FSHOOK_REG_ARG1:   s->fshook.arg1   = v;  return;
+        case FSHOOK_REG_ARG2:   s->fshook.arg2   = v;  return;
+        case FSHOOK_REG_RESULT: s->fshook.result = v;  return;
+        case FSHOOK_REG_ERRNO:  s->fshook.err    = v;  return;
+        case FSHOOK_REG_TRACE: {
+            char buf[256];
+            if (fshook_read_guest_path(v, buf, sizeof(buf))) {
+                fprintf(stderr, "FS_HOOK: TRACE \"%s\" (NIP=0x%08x LR=0x%08x)\n",
+                        buf, (unsigned)s->cpu->env.nip,
+                        (unsigned)s->cpu->env.lr);
+            } else {
+                fprintf(stderr, "FS_HOOK: TRACE <bad ptr 0x%08x>\n", v);
+            }
+            fflush(stderr);
+            return;
+        }
+        default:                return;
+        }
+    }
 
     /*
      * IC register write: ack legacy SLT path. We deliberately do NOT
