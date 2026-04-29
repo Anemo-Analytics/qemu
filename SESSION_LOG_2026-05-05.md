@@ -1,4 +1,4 @@
-# Session 2026-05-05 — gate 9 dispatch hunt: phase 0 done, phase 1.B doesn't crack it
+# Session 2026-05-05 — gate 9 dispatch hunt: SLT1 drop confirms MSR.EE=0 is the real wall
 
 Plan: in-message plan from PLAN_2026-05-05 ("close the FEC RX IRQ
 loop, wake tFecEndRx"). Phase 0 diagnostics + Phase 1 dispatch fix
@@ -172,30 +172,112 @@ grep "IC W +0x510" /tmp/qemu_p1c.log | tail -1          # MainMask = 0x00000000
 - Gate 9 status unchanged: TCP handshake works, byte-level comms
   doesn't.
 
-## Next session plan
+## Phase 1.X — additional dispatch experiment, post-agent review
 
-Phase 2.A — direct sem poke. From the RX hook, after BD update +
-SDMA RAISE, write into the VxWorks sem at `0x07bee080` to mark
-it given. tFecEndRx wakes up regardless of whether EXT dispatch
-ever runs. Steps:
+After agents reviewed the plan and pointed out an EXT-OR
+hypothesis (`s->ic_pending` SLT1 holds the line high), tried
+a third dispatch attempt: drop SLT1 from `mpc5200_update_ext`
+OR. sysClkInt is on the DEC vector (per
+BSP_static_a1_vxworks.md and runtime station 0x117fd0), so the
+clock keeps working even with SLT1 removed from EXT.
 
-1. Dump 64 bytes at `0x07bee080` (pre-PEND and post-PEND) to
-   verify VxWorks `SEM_OBJ` layout (magic, type, state count,
-   semQueue head).
-2. Find a working sem-give path in the BSP (e.g. SLT1 timer's
-   sysClkInt is known to do `semGive` somewhere — disasm it for
-   the byte sequence to mimic).
-3. From the RX hook, mimic semGive: if semQueue non-empty,
-   dequeue first task and mark it READY (TCB+0x3C: 2→0); if
-   empty, increment count.
+Built and ran with enhanced SDMA eval diagnostic that dumps
+`pi.EXT` (CPU pending_interrupts EXT bit) and `MSR.EE` at the
+moment of evaluation.
 
-Risk: VxWorks ready queue invariants we miss. Mitigate by
-matching observed working sem state exactly.
+**Result of SLT1-drop experiment:**
 
-Fallback: Phase 2.B — install one-shot patch at SLT1 tick that
-calls BSP's `semGive(0x07bee080)`. Doorbell scaffolding already
-exists at FSHOOK_OFFSET; add new opcode for sem-give. Safer
-because BSP's own kernel does the work.
+```
+SDMA eval: IntPending=0x0000000c IntMask=0xeffffff7 unmasked=0x00000008
+RAISE  [pi.EXT=0 MSR.EE=0 slt=1 fec=0 sdma=1 nip=0x00145430]
+EXT line 0->1 (slt=1 fec=0 sdma=1) #47
+```
 
-Out of scope: deeper QEMU interrupt-routing investigation (would
-be a multi-day rabbit hole).
+Two facts:
+
+1. ✅ **The fix worked at the OR level.** `pi.EXT=0` BEFORE
+   the RAISE — confirms SLT1 was indeed holding `pending_
+   interrupts` EXT bit set previously, and removing SLT1 from
+   the OR cleanly produced a 0→1 transition in
+   `pending_interrupts`.
+
+2. ❌ **MSR.EE=0 throughout.** Every SDMA eval, EE=0. The CPU
+   is in a state where interrupts are disabled. When
+   `ppc_set_irq(EXT,1)` calls `ppc_maybe_interrupt`, it sees
+   `async_deliver = msr.EE || resume_as_sreset` = 0,
+   and falls through to `cpu_reset_interrupt(HARD)` —
+   clears the HARD bit. The line is up in
+   `pending_interrupts`, but the CPU never re-evaluates
+   because its idle loop never enables EE.
+
+3. ❌ **Same NIP=0x145430 across all SDMA eval calls.** CPU is
+   stuck in some kernel idle/lock loop with EE=0. FEC IRQs
+   that DID dispatch happened during BSP init when EE was 1
+   most of the time. By the time SDMA needs to deliver, the
+   BSP has entered steady-state where EE=0 dominates.
+
+4. ❌ **Still 0 STATION HIT 0x132854.**
+
+So **dispatch is genuinely walled off by an EE=0 hold**, not
+just an edge issue. Three dispatch experiments now ruled out
+(1.A mask, 1.B edge re-trigger, 1.X SLT1 drop). Reverted: PEND-
+WATCH (didn't fire — diag_sample stops at 60s of guest time).
+Kept: SLT1 drop (it's correct — sysClkInt is DEC-vector) and
+enhanced SDMA eval diagnostic.
+
+## What's permanently in code after this session
+
+- `g_boot_stations[]`: SDMA Main ISR @ 0x132854 entry (Phase
+  0.1).
+- IC MMIO write logging at MBAR+0x500..0x52c with per-offset
+  decode (Phase 0.3).
+- `mpc5200_update_ext` no longer ORs in `s->ic_pending` (Phase
+  1.X — sysClkInt is on DEC, removing SLT1 from EXT is correct
+  regardless of dispatch outcome).
+- `mpc5200_sdma_eval_irq` enhanced log: `pi.EXT`, `MSR.EE`,
+  per-source flags, NIP (Phase 1.X diagnostic — invaluable for
+  future debug).
+
+## Next session plan — pivot
+
+QEMU dispatch hunt has yielded enough information to decide.
+Three dispatch experiments ruled out, MSR.EE=0 confirmed as the
+wall. Two paths from here:
+
+### Path A — Phase 2.B (BSP-side semGive shim)
+
+Install a one-shot patch on SLT1 tick callback (or some periodic
+BSP code site) that, when triggered by a flag we set, calls the
+BSP's own `semGive(0x07bee080)`. Doorbell scaffolding already
+exists at `FSHOOK_OFFSET`. Per agent 2's review, **don't try
+direct sem-poke** — VxWorks `SEM_OBJ` layout assumed in the plan
+was wrong (magic at +0 is a class pointer, not ASCII tag; Q_HEAD
+is 16 bytes; ready-queue invariants are extensive). BSP's own
+kernel must do the give.
+
+First step (per agent 2): no-code-change run that dumps 64 bytes
+at `0x07bee080` + 2 other sems for layout comparison. **Only
+after that** decide between approaches.
+
+Estimated time-to-first-RX-wake: 1-2 sessions.
+
+### Path B — strategic pivot to Python responder (agent 3's recommendation)
+
+`/home/kasper/WindowsVMDeploy/Builds/v2_vmp6000_simulator/ap_server.py`
+already exists. Toolkit cares about XML responses on AP/Firedrake/
+FTP ports, not what's behind the wire. Use the existing
+`AP_PROTOCOL_REFERENCE.md` (1622 lines) + 14 turbine PCAPs +
+existing simulator to drive the toolkit through gates 10-12.
+QEMU becomes a witness for protocol correctness rather than the
+production path.
+
+Estimated time-to-software-load demo: 2-4 weeks (vs. 3-6 months
+on QEMU path with same blockers).
+
+### Recommendation
+
+Path B is strategically right. Path A is one more "make tFecEndRx
+wake" attempt that might unblock gate 9 but doesn't shorten the
+path to gate 12. Doing both in parallel is fine if there's a
+specific Python-responder gap that needs QEMU validation, but
+QEMU shouldn't be the critical path anymore.
