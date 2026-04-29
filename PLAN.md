@@ -64,7 +64,19 @@ shim reads/clears it, tail-calls `semGive(0x07bee080)` at
 blocker is downstream of semGive — either the slow path bails on a
 class-magic check, or the wake gets queued via workQAdd and never
 dispatched (windExit can't run if MSR.EE=0 hold persists). See
-`SESSION_LOG_2026-05-06.md`. `tApMain`/`tFirecrest` not yet seen by
+`SESSION_LOG_2026-05-06.md`.
+**2026-05-07:** 4-step diagnostic. Step 0 (swap shim tail-call from
+semGive to semFlush at `0x002ff884`, which has a wake-all impl)
+ran end-to-end (SEM-HIST confirms prologue + body + epilogue
+sampled) but tFecEndRx still PEND. SEM-LAYOUT cross-check
+(`0x07bee080` failing vs `0x00980a48` tNetTask vs `0x07ba6828`
+tWdbTask) — identical structure, falsifies the layout-mismatch
+hypothesis. TCB-WATCH at 60 Hz across vt=8..14s — zero status
+transitions, the wake never reaches the scheduler. Surviving cause:
+**workQAdd defers wake; windExit/workQ-drain never dispatches it**.
+ALL other PEND'd tasks also stuck at PC=`0x002fe918` — kernel
+scheduler isn't dispatching anyone post-doorbell. See
+`SESSION_LOG_2026-05-07.md`. `tApMain`/`tFirecrest` not yet seen by
 name. Realistic remaining:
 
 - **Gate 4 exercise** (small): switch netdev to allow host→guest traffic
