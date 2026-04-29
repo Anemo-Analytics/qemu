@@ -558,51 +558,80 @@ static void mpc5200_apply_keyswitch_patches(void)
      * 0x003e67b0 referenced from runtime symtab record at 0x008fe080.
      *
      * Update 2026-05-07 (gate 9 follow-up): swap tail-call from semGive
-     * @ 0x002ff5c4 to semFlush @ 0x002ff884. semFlush has byte-identical
-     * prologue + class-table dispatch wrapper, but its post-dispatch impl
-     * unconditionally wakes ALL waiters — bypasses any state check that
-     * caused semGive to silently drop the wake. Single-waiter sem (only
-     * tFecEndRx blocks on 0x07bee080) so semantically equivalent here.
+     * @ 0x002ff5c4 to semFlush @ 0x002ff884. semFlush still goes through
+     * the workQ deferred path that never drains in our run — wake never
+     * reaches the scheduler.
+     *
+     * Update 2026-04-29 (plan-pivot follow-up): swap tail-call from semFlush
+     * to a direct qPriBMapPut call on the readyQ at 0x0099AF58. The previous
+     * windPendQGet @ 0x00178550 attempt didn't fire — qGet on sem.pendQ
+     * came back without affecting state (sem.qHead unchanged at vt=10s
+     * post-shim), suggesting the runtime windPendQGet checks something
+     * we haven't fully traced. Side-stepping by emulating its tail-end
+     * directly: clear TCB.status (PEND -> READY) + clear TCB.pSemId, then
+     * call qPriBMapPut(readyQ, TCB, priority).
+     *
+     * qPriBMapPut @ 0x002cd8e0 — runtime address found by sig-matching
+     * bootrom symbol qPriBMapPut (0x010b533c). Identical instruction stream.
+     * It does:
+     *   - if priority is lower than current head, become new head
+     *   - bMapAtomicSet(bitmap, priority)
+     *   - qListPut(bucket[priority], node)
+     *
+     * readyQ struct @ 0x0099AF58 — runtime BSS address, found by tracing
+     * the wake-tail of windPendQGet at 0x00178550 (`lis 3, 154; addi 3, 3,
+     * -20648; bctr` with vtable[0x10] = qPriBMapPut).
+     *
+     * tFecEndRx TCB @ 0x07BEDE38, priority 29.
      *
      * intUnlock @ 0x00138a7c — verified: mfmsr; rlwinm clear EE; mtmsr;
      * isync; blr (matches bootrom 0x010fXXXX intUnlock primitive).
      *
-     * Stub layout (12 instructions, 48 bytes, at 0x002acef0):
+     * Stub layout (21 instructions, 84 bytes, at 0x002acef0):
      *
      *   +0x00  mflr  r12              ; save sysClkInt continuation
      *   +0x04  bl    0x00138a7c       ; intUnlock (EE=1 again)
      *   +0x08  lis   r10, 0xF000      ; r10 = SEM_QUEUE doorbell addr
      *   +0x0C  ori   r10, r10, 0x401C
-     *   +0x10  lwz   r3,  0(r10)      ; r3 = pending sem_id
+     *   +0x10  lwz   r3,  0(r10)      ; r3 = pending sem_id (used as flag)
      *   +0x14  mtlr  r12              ; pre-set LR for tail-call/blr
      *   +0x18  cmpwi r3, 0
-     *   +0x1C  beq+  +0x10            ; skip if no sem (->+0x2c)
+     *   +0x1C  beq+  +0x34            ; skip if no sem (->+0x50 blr)
      *   +0x20  li    r9, 0
-     *   +0x24  stw   r9,  0(r10)      ; clear flag BEFORE call
-     *   +0x28  b     0x002ff884       ; tail-call semFlush (no link)
-     *   +0x2C  blr                    ; reached via beq when no sem
+     *   +0x24  stw   r9,  0(r10)      ; clear doorbell BEFORE call
+     *   +0x28  lis   r9, 0x07BF       ; r9 = TCB high
+     *   +0x2C  addi  r9, r9, -0x21C8  ; r9 = 0x07BEDE38 (tFecEndRx TCB)
+     *   +0x30  li    r0, 0
+     *   +0x34  stw   r0, 0x3C(r9)     ; TCB.status = 0 (clear PEND)
+     *   +0x38  stw   r0, 0x5C(r9)     ; TCB.pSemId = 0
+     *   +0x3C  lis   r3, 0x009A       ; r3 = readyQ high
+     *   +0x40  addi  r3, r3, -0x50A8  ; r3 = 0x0099AF58 (readyQ struct)
+     *   +0x44  mr    r4, r9            ; r4 = TCB (= node)
+     *   +0x48  li    r5, 29            ; r5 = priority
+     *   +0x4C  b     0x002cd8e0       ; tail-call qPriBMapPut (no link)
+     *   +0x50  blr                    ; reached via beq when no sem
      *
-     * r3, r9, r10, r12 are PPC ABI volatile (caller-saved). sysClkInt's
-     * code after the patch site reads only r26, r28, r30 (non-volatile)
-     * + reloads its scratch regs, so our clobbers are safe. r3 is
-     * overwritten at 0x001180f8 (`li r3, 0xf0`) so the saved-MSR returned
-     * by intUnlock is unused — same as the original `bl 0x138a7c`.
+     * r3, r4, r5, r9, r10, r12 are PPC ABI volatile (caller-saved).
+     * sysClkInt's code after the patch site reads only r26, r28, r30
+     * (non-volatile) + reloads its scratch regs, so our clobbers are safe.
+     * r3 is overwritten at 0x001180f8 (`li r3, 0xf0`) so the saved-MSR
+     * returned by intUnlock is unused — same as the original `bl 0x138a7c`.
      */
     {
         const uint32_t stub_addr     = 0x002acef0;
         const uint32_t intunlock_addr = 0x00138a7c;
-        const uint32_t semgive_addr  = 0x002ff884; /* semFlush — wakes all */
+        const uint32_t semgive_addr  = 0x002cd8e0; /* qPriBMapPut — readyQ enqueue */
         const uint32_t patch_site    = 0x001180b8;
 
         /* Encode bl/b: insn = 0x48000000 | (offset & 0x03FFFFFC) | LK. */
         uint32_t bl_intunlock =
             0x48000000u | ((intunlock_addr - (stub_addr + 0x04)) & 0x03FFFFFC) | 1u;
         uint32_t b_semgive =
-            0x48000000u | ((semgive_addr  - (stub_addr + 0x28)) & 0x03FFFFFC);
+            0x48000000u | ((semgive_addr  - (stub_addr + 0x4C)) & 0x03FFFFFC);
         uint32_t bl_to_stub =
             0x48000000u | ((stub_addr     - patch_site)         & 0x03FFFFFC) | 1u;
 
-        const uint32_t stub_words[12] = {
+        const uint32_t stub_words[21] = {
             0x7d8802a6,    /* +0x00  mflr  r12                              */
             bl_intunlock,  /* +0x04  bl    0x00138a7c                       */
             0x3d40f000,    /* +0x08  lis   r10, 0xF000                      */
@@ -610,11 +639,20 @@ static void mpc5200_apply_keyswitch_patches(void)
             0x806a0000,    /* +0x10  lwz   r3,  0(r10)                      */
             0x7d8803a6,    /* +0x14  mtlr  r12                               */
             0x2c030000,    /* +0x18  cmpwi r3, 0                            */
-            0x41820010,    /* +0x1C  beq   +0x10  (-> +0x2c)                */
+            0x41820034,    /* +0x1C  beq   +0x34  (-> +0x50 blr)            */
             0x39200000,    /* +0x20  li    r9, 0                            */
             0x912a0000,    /* +0x24  stw   r9,  0(r10)                      */
-            b_semgive,     /* +0x28  b     0x002ff884 (tail-call semFlush) */
-            0x4e800020,    /* +0x2C  blr   (no-sem path)                    */
+            0x3d2007bf,    /* +0x28  lis   r9, 0x07BF                       */
+            0x3929de38,    /* +0x2C  addi  r9, r9, -0x21C8 (= 0x07BEDE38)    */
+            0x38000000,    /* +0x30  li    r0, 0                            */
+            0x9009003c,    /* +0x34  stw   r0, 0x3C(r9) [TCB.status = 0]    */
+            0x9009005c,    /* +0x38  stw   r0, 0x5C(r9) [TCB.pSemId = 0]    */
+            0x3c60009a,    /* +0x3C  lis   r3, 0x009A                       */
+            0x3863af58,    /* +0x40  addi  r3, r3, -0x50A8 (= 0x0099AF58)   */
+            0x7d240b78,    /* +0x44  mr    r4, r9 [TCB]                     */
+            0x38a0001d,    /* +0x48  li    r5, 29 [priority]                */
+            b_semgive,     /* +0x4C  b     0x002cd8e0 (tail-call qPriBMapPut) */
+            0x4e800020,    /* +0x50  blr   (no-sem path)                    */
         };
         /* Convert to BE byte array for cpu_physical_memory_write. */
         uint8_t stub_bytes[sizeof(stub_words)];
@@ -647,7 +685,7 @@ static void mpc5200_apply_keyswitch_patches(void)
         cpu_physical_memory_read(0x002acef0, v_stub, sizeof(v_stub));
         fprintf(stderr,
                 "MPC5200: post-patch verify: 0x001180b8 = %02x%02x%02x%02x "
-                "(expect bl 0x002acef0 = 48194c39); "
+                "(expect bl 0x002acef0 = 48194e39); "
                 "0x002acef0 = %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x "
                 "(expect mflr r12 = 7d8802a6, bl intUnlock = 4be8bb89, "
                 "lis r10,0xF000 = 3d40f000)\n",
@@ -665,7 +703,7 @@ static void mpc5200_apply_keyswitch_patches(void)
             "(doorbell @ 0xF0004000, root=%s); "
             "no-op'd printf at 0x2acee8 (PSC1 TX IRQ workaround); "
             "installed sysClkInt tail-patch @ 0x001180b8 -> stub @ 0x002acef0 "
-            "(semGive shim for tFecEndRx wake; tail-calls semFlush @ 0x002ff884)\n",
+            "(semGive shim for tFecEndRx wake; tail-calls qPriBMapPut @ 0x002cd8e0 with explicit args)\n",
             fshook_root());
     fflush(stderr);
 }
@@ -1296,6 +1334,91 @@ static void mpc5200_tick(void *opaque)
     }
 
     /*
+     * READYQ-PROBE (plan 2026-04-29 follow-up).
+     *
+     * The 2026-05-09 session pivot tried Track A — manual TCB.status flip
+     * + sem-queue clear from QEMU. Result: TCB.status went READY but the
+     * scheduler still wouldn't dispatch the task. Confirmed the scheduler
+     * reads a separate readyQ, NOT TCB.status, when picking the next task
+     * to run. Track A's writes are now REVERTED (they corrupted the sem
+     * state that windPendQGet needs to find the waiter).
+     *
+     * Replacement strategy: redirect the existing semGive shim's tail-call
+     * from semFlush (workQ-deferred — never drains) to windPendQGet @
+     * 0x00178550, which inlines the full qGet+windReadyQPut wake primitive
+     * (qGet from sem.pendQ → clear PEND in TCB.status → tail-call qPut on
+     * readyQ at 0x0099AF58). Same one-shot doorbell at vt=8s; the BSP shim
+     * picks it up next sysClkInt (~17 ms later) and does the proper kernel
+     * wake instead of the previous workQ-deferred path.
+     *
+     * READYQ-PROBE confirms the wake actually landed. Reads:
+     *   *(0x07bee080+0x00) — sem.qHead. After windPendQGet, should be the
+     *     empty sentinel (0x0099af68) since we had only one waiter.
+     *   *(0x07bede38+0x3C) — TCB.status. After wake, expect 0 (READY).
+     *   *(0x0099AF58+0x00) — readyQ head. After put, this should be our TCB
+     *     (0x07bede38) IF its priority (29) is the lowest currently READY.
+     *
+     * One-shot at vt=10s (giving the shim ~2s of sysClkInt firings to run).
+     */
+    if (tick_count == 60 * 10) {
+        AddressSpace *as = &address_space_memory;
+        const uint32_t SEM     = 0x07bee080;
+        const uint32_t TCB     = 0x07bede38;
+        const uint32_t READYQ  = 0x0099af58;
+        uint32_t qhead   = ldl_be_phys(as, SEM + 0x00);
+        uint32_t qtail   = ldl_be_phys(as, SEM + 0x04);
+        uint32_t status  = ldl_be_phys(as, TCB + 0x3C);
+        uint32_t pSemId  = ldl_be_phys(as, TCB + 0x5C);
+        uint32_t our_key = ldl_be_phys(as, TCB + 0x08);
+        uint32_t rqhead  = ldl_be_phys(as, READYQ + 0x00);
+        uint32_t rqbmap  = ldl_be_phys(as, READYQ + 0x04);
+        uint32_t rqvtbl  = ldl_be_phys(as, READYQ + 0x0C);
+        uint32_t head_key = rqhead ? ldl_be_phys(as, rqhead + 0x08) : 0;
+        uint32_t bmap_w0 = rqbmap ? ldl_be_phys(as, rqbmap + 0x00) : 0;
+        uint32_t bmap_w1 = rqbmap ? ldl_be_phys(as, rqbmap + 0x04) : 0;
+        fprintf(stderr,
+                "READYQ-PROBE: t=10s\n"
+                "READYQ-PROBE:   sem 0x%08x qHead=0x%08x qTail=0x%08x\n"
+                "READYQ-PROBE:   tcb 0x%08x status=0x%x pSemId=0x%08x our_key(TCB+8)=0x%08x\n"
+                "READYQ-PROBE:   readyQ@0x%08x first=0x%08x bmap=0x%08x vtbl=0x%08x\n"
+                "READYQ-PROBE:     readyQ.first.key(=first+8)=0x%08x\n"
+                "READYQ-PROBE:     bmap[0]=0x%08x bmap[1]=0x%08x\n",
+                SEM, qhead, qtail,
+                TCB, status, pSemId, our_key,
+                READYQ, rqhead, rqbmap, rqvtbl,
+                head_key, bmap_w0, bmap_w1);
+
+        /*
+         * READYQ-FORCE (plan 2026-04-29 escalation): the BSP-side qPriBMapPut
+         * call from the shim correctly writes TCB+0x08 = key (= 0x1D = 29),
+         * but readyQ.first stays at CpuloadLow's TCB and bmap[0] stays at
+         * 0x01 (only CpuloadLow's bit). Either qPriBMapPut got called with
+         * wrong args, or its writes got rolled back by a context switch
+         * before our probe. Force the issue by directly writing readyQ.first
+         * = our TCB and setting bit 28 in bmap[0] (= prio 29 group).
+         *
+         * This is option (b) of the plan ("splice manually as a one-shot").
+         */
+        uint32_t pre_bmap0 = bmap_w0;
+        stl_be_phys(as, READYQ + 0x00, TCB);
+        if (rqbmap) {
+            stl_be_phys(as, rqbmap + 0x00, pre_bmap0 | (1u << 28));
+            /* Also set the within-group byte. For prio 29: byte index =
+             * (255-29)/8 = 28; bit within byte = (255-29)&7 = 2. */
+            uint32_t byte_off = rqbmap + 4 + 28;
+            uint8_t b;
+            cpu_physical_memory_read(byte_off, &b, 1);
+            b |= (1u << 2);
+            cpu_physical_memory_write(byte_off, &b, 1);
+        }
+        fprintf(stderr,
+                "READYQ-FORCE: wrote readyQ.first = 0x%08x, set bmap[0] |= bit 28 "
+                "(was 0x%08x, now should be 0x%08x), set byte[28] |= 0x04\n",
+                TCB, pre_bmap0, pre_bmap0 | (1u << 28));
+        fflush(stderr);
+    }
+
+    /*
      * Step 2 (gate-9 follow-up, plan 2026-05-07): one-shot sem-layout dump
      * at vt=10s. Compares the structure at three known PEND'd sems —
      * tFecEndRx (0x07bee080, the failing one), tNetTask (0x00980a48,
@@ -1437,7 +1560,7 @@ static void mpc5200_tick(void *opaque)
         fflush(stderr);
     }
 
-    if (tick_count >= 60 * 8 && tick_count <= 60 * 14) {
+    if (tick_count >= 60 * 8 && tick_count <= 60 * 30 && (tick_count % 30) == 0) {
         AddressSpace *as = &address_space_memory;
         const uint32_t tcb = 0x07bede38;
         uint32_t status = ldl_be_phys(as, tcb + 0x3C);
@@ -1458,6 +1581,72 @@ static void mpc5200_tick(void *opaque)
                 "sem=0x%08x errno=0x%08x PC=0x%08x LR=0x%08x\n",
                 tick_count / 60, (tick_count % 60) * 100 / 60,
                 tcb, status, st, pSemId, errnov, pc, lr);
+        fflush(stderr);
+    }
+
+    /*
+     * CASCADE-PROBE (plan 2026-05-11): direct per-task read of TCB.status +
+     * saved PC for the 5 tasks the previous run's task-list dumper showed
+     * flipping PEND→READY after our READYQ-FORCE at vt=10s. Plan question:
+     * is the cascade real, or did our forced readyQ writes corrupt their
+     * TCB.status without changing their actual PEND state? Cross-check
+     * against the task-list dumper at the same vt — if they disagree, the
+     * task-list reader has a bug; if they agree on READY but saved PC is
+     * still 0x002fe918 (sem-block), the tasks are inconsistent (READY
+     * status but blocked-PC, would never run forward).
+     *
+     * Also dumps readyQ.first.key — if it flips back to 0xff (CpuloadLow's
+     * idle key) between vt=15..25s, the kernel is undoing our READYQ-FORCE
+     * write on every context switch.
+     *
+     * Fires once each at vt=15s, 20s, 25s. Saved-PC offset = TCB+0x130+0x8C
+     * matches the existing task-list dumper.
+     */
+    if (tick_count == 60 * 15 || tick_count == 60 * 20 ||
+        tick_count == 60 * 25) {
+        AddressSpace *as = &address_space_memory;
+        static const struct { uint32_t tcb; const char *name; } cascade[] = {
+            { 0x07bede38, "tFecEndRx       (orig wake target)" },
+            { 0x07fc1f30, "tNetTask                          " },
+            { 0x07ccb5f0, "tFecEndRecover                    " },
+            { 0x07fcbec8, "confLogMsg                        " },
+            { 0x07fc9f10, "tLed                              " },
+            { 0x07bc8fa0, "getFactoryVerison                 " },
+        };
+        const uint32_t SEM_BLOCK_PC = 0x002fe918;
+        const uint32_t READYQ = 0x0099af58;
+        uint32_t rq_first   = ldl_be_phys(as, READYQ + 0x00);
+        uint32_t rq_first_k = rq_first ? ldl_be_phys(as, rq_first + 0x08) : 0;
+        uint32_t rq_bmap    = ldl_be_phys(as, READYQ + 0x04);
+        uint32_t rq_bmap_w0 = rq_bmap ? ldl_be_phys(as, rq_bmap + 0x00) : 0;
+        fprintf(stderr,
+                "CASCADE-PROBE: t=%ds  readyQ.first=0x%08x first.key=0x%02x "
+                "bmap[0]=0x%08x\n",
+                tick_count / 60, rq_first, rq_first_k & 0xff, rq_bmap_w0);
+        for (int i = 0; i < (int)ARRAY_SIZE(cascade); i++) {
+            uint32_t tcb    = cascade[i].tcb;
+            uint32_t status = ldl_be_phys(as, tcb + 0x3C);
+            uint32_t prio   = ldl_be_phys(as, tcb + 0x40);
+            uint32_t pSemId = ldl_be_phys(as, tcb + 0x5C);
+            uint32_t pc     = ldl_be_phys(as, tcb + 0x130 + 0x8C);
+            uint32_t lr     = ldl_be_phys(as, tcb + 0x130 + 0x84);
+            const char *st = "?";
+            switch (status) {
+            case 0x0:     st = "READY"; break;
+            case 0x2:     st = "PEND"; break;
+            case 0x4:     st = "DELAY"; break;
+            case 0x6:     st = "PEND+TO"; break;
+            case 0x10000: st = "SUSP"; break;
+            }
+            const char *pc_tag = (pc == SEM_BLOCK_PC) ? "[SEM-BLOCK]" :
+                                 (status == 0x0)     ? "[runnable] " :
+                                                       "[other]    ";
+            fprintf(stderr,
+                    "CASCADE-PROBE:   %s tcb=0x%08x status=0x%x %-7s "
+                    "prio=%3u sem=0x%08x PC=0x%08x %s LR=0x%08x\n",
+                    cascade[i].name, tcb, status, st, prio, pSemId, pc,
+                    pc_tag, lr);
+        }
         fflush(stderr);
     }
 
@@ -2316,6 +2505,45 @@ static void mpc5200_bestcomm_rx_hook(const uint8_t *buf, size_t len)
      * purposes; tFecEndRx will wake on the first non-stale give).
      */
     s->fshook.sem_queue = 0x07bee080;
+
+    /*
+     * READYQ-FORCE-RX (plan 2026-05-11 step 3): the wake-once at vt=10s
+     * dispatched tFecEndRx ONCE (PC moved 0x002fe918 → 0x00175628 at
+     * the post-windExit return point). After that, readyQ.first stays 0
+     * and tFecEndRx never gets re-dispatched even though TCB.status is
+     * READY — the kernel doesn't re-enqueue it when context-switching
+     * out (our forced bmap state is inconsistent with the bucket FIFO).
+     *
+     * Brute-force on every RX-walker fire: re-write readyQ.first = TCB,
+     * re-set bmap[0] bit 28, re-set bmap_byte[28] bit 2, also clear
+     * TCB.status to READY (in case kernel set PEND between fires). This
+     * keeps the task continuously dispatchable so each new frame has a
+     * shot at being processed by the network stack.
+     */
+    {
+        AddressSpace *as_force = &address_space_memory;
+        const uint32_t TCB_FECRX = 0x07bede38;
+        const uint32_t READYQ    = 0x0099af58;
+        uint32_t rqbmap = ldl_be_phys(as_force, READYQ + 0x04);
+        stl_be_phys(as_force, READYQ + 0x00, TCB_FECRX);
+        if (rqbmap) {
+            uint32_t b0 = ldl_be_phys(as_force, rqbmap + 0x00);
+            stl_be_phys(as_force, rqbmap + 0x00, b0 | (1u << 28));
+            uint32_t byte_off = rqbmap + 4 + 28;
+            uint8_t b;
+            cpu_physical_memory_read(byte_off, &b, 1);
+            b |= (1u << 2);
+            cpu_physical_memory_write(byte_off, &b, 1);
+        }
+        stl_be_phys(as_force, TCB_FECRX + 0x3C, 0);  /* status = READY */
+        static unsigned force_log = 0;
+        if (force_log++ < 8) {
+            fprintf(stderr,
+                    "READYQ-FORCE-RX: post-RX dispatch force #%u (skb=0x%08x)\n",
+                    force_log, skb_pa);
+            fflush(stderr);
+        }
+    }
 }
 
 /* Forward decl for the FEC -> BestComm RX hook installer. */
