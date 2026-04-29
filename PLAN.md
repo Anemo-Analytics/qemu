@@ -27,8 +27,8 @@ verifies.
 | **4** | BestComm executor — RX | Inbound frame's BD copy + EIR.RXF + SDMA RX IRQ delivered to BSP | host-injected frame → `BestComm RX:` log + `tFecEndRx` unblocks | ✅ **closed 2026-04-30.** With `hostfwd` plumbing in `run.sh`, host-side `nc` to forwarded ports triggers RX walker repeatedly — `BestComm RX:` walks the full BD ring (0x9600 → 0x9638). |
 | **5** | ~~FTP boot completes~~ | superseded — this BSP image doesn't *try* to FTP-boot from `.252` | n/a | ⚠️ **bypassed, not achieved.** BSP runs without an FS image being pulled. Whether it had a usable FS or not is unknown |
 | **6** | First serial banner | Vestas app emits banner on PSC | `PSC_TX[…]: Wind World ...` log line | ❌ **not achieved.** No PSC TX observed — Vestas app isn't running |
-| **7** | Filesystem available | **`/fs/` mounted, `/fs/etc/startup.app` loadable** | BSP doesn't print "Cannot find startup.app in runmode !" | ✅ **closed 2026-05-03.** BSP reads real bytes from host `/fs/`: `FS_HOOK: open("/fs/manifest.csv") -> fake_fd=1000` plus 9× read pulls 8.7 KiB; `fdconfig.def` (734 B) and `startup.fail` (4 B) also read. Upstream stall referenced in the previous note was inside `usrToolsInit`'s banner-printer (printf → iosWrite → kernel sem block on a PSC1 TX-empty IRQ that never fires); bypassed with a `printf` no-op at `0x2acee8`. Patch installer also moved from first SLT-tick (delayed 1s of guest time) to first diag-sample (1µs) so it lands before the BSP enters the patched function. See `SESSION_LOG_2026-05-03.md`. Note: `startup.app` itself isn't opened yet — the `fs-exists` stub at `0x13ffe4` always returns 1, so the BSP's `force_safe_mode` probe takes the safe path. Trivial follow-up: route `fs-exists` through the same doorbell. |
-| **8** | Vestas application boots | `startup.app` runs, `tApMain`/`tFirecrest`/`tFiredrake` appear | task list contains those names, banner emitted | 🟡 **Firedrake side alive 2026-05-03.** Task list now has 35 entries (was 21). New: `fdUpg`, `fdSockMgr`, `fdMsgHandler`, `fdServer`, `fdNgbors`, `fdShExec` (Firedrake daemons), plus `tArcRcv`, `tCapReceive`, `tCapTimeout`, `tNAT`, `tShutHook`, `tRtcControl`, `CronTask`, `tShell`, `tOsStatusService`, `tRandom`, `tTimeLog`. Not yet seeing `tApMain`/`tFirecrest` by name — startup.app's loadable modules aren't being processed (no `/fs/etc/startup.app` open observed; BSP took an early-config path before reaching the script runner). |
+| **7** | Filesystem available | **`/fs/` mounted, `/fs/etc/startup.app` loadable** | BSP doesn't print "Cannot find startup.app in runmode !" | ✅ **closed 2026-05-03; trivial follow-up 2026-05-08.** BSP reads real bytes from host `/fs/`: `FS_HOOK: open("/fs/manifest.csv") -> fake_fd=1000` plus 9× read pulls 8.7 KiB; `fdconfig.def` (734 B) and `startup.fail` (4 B) also read. Upstream stall referenced in the previous note was inside `usrToolsInit`'s banner-printer (printf → iosWrite → kernel sem block on a PSC1 TX-empty IRQ that never fires); bypassed with a `printf` no-op at `0x2acee8`. **2026-05-08:** `fs-exists` at `0x13ffe4` is now an honest hypercall (`FS_EXISTS=6`, `access(F_OK)`) — the BSP's `force_safe_mode` probe gets a real `0` and proceeds to the runtime path. See `SESSION_LOG_2026-05-08.md`. |
+| **8** | Vestas application boots | `startup.app` runs, `tApMain`/`tFirecrest`/`tFiredrake` appear | task list contains those names, banner emitted | 🟡 **Firedrake side alive 2026-05-03; further advance 2026-05-08.** Task list at vt=58s in the 2026-05-08 run shows 30 entries with new families beyond the 2026-05-03 set: Arc protocol (`tArcService`, `tArcFastRx`, `tArcRcv`), Cap protocol (`tCapReceive`, `tCapTimeout`), `tNAT`, `tTimeLog`, `tDcacheUpd` — courtesy of the honest `FS_EXISTS` hypercall flipping the BSP off the safe-mode path so it loads `/fs/etc/fdconfig.def` and probes more of the runtime config. **Still NOT seeing `tApMain`/`tFirecrest` by name** — `/fs/etc/startup.app` not yet opened; one more fs-exists probe is probably gating the script runner, or it's gated on tFecEndRx unblocking (gate 9). |
 | **9** | Network listener up | Vestas app opens AP / Firecrest / Firedrake ports | `nmap -p 8080,9482,...` from host shows listening ports | 🟡 **partially advanced 2026-04-30.** Generic VxWorks daemons confirmed listening: FTP (21), portmap (111), NFS (2049) all accept TCP handshake from host via `nc` over `hostfwd`. **AP / Firecrest / Firedrake ports still NOT verified** — those belong to the Vestas app which isn't running. |
 | **10** | Toolkit recognizes turbine | VMP6000 Toolkit lists our QEMU under "available turbines" with the right board ID | Toolkit UI screenshot showing CT6003_Motherboard_V3 entry | ⏳ |
 | **11** | Toolkit reads parameters | Toolkit reads a parameter (e.g. RatedPower) and gets a plausible value | Toolkit UI shows non-zero value, not "comm error" | ⏳ |
@@ -76,8 +76,26 @@ transitions, the wake never reaches the scheduler. Surviving cause:
 **workQAdd defers wake; windExit/workQ-drain never dispatches it**.
 ALL other PEND'd tasks also stuck at PC=`0x002fe918` — kernel
 scheduler isn't dispatching anyone post-doorbell. See
-`SESSION_LOG_2026-05-07.md`. `tApMain`/`tFirecrest` not yet seen by
-name. Realistic remaining:
+`SESSION_LOG_2026-05-07.md`.
+**2026-05-08:** Two-track session. Track 2 (gate 8 advance):
+`fs-exists` at `0x0013ffe4` upgraded from "always 1" to a real
+`FS_EXISTS=6` hypercall running `access(F_OK)`. BSP gets honest
+miss on `/fs/etc/force_safe_mode`, advances off safe-mode, opens
+`fdconfig.def` and `startup.fail`, spawns 22 new tasks beyond the
+2026-05-07 baseline. Track 1 (gate 9 narrowing): SEM-CLASS dump
+shows class[7] = `0x002ffe68`; SEM-GLOBALS shows `*(0x0090879c) =
+1` — semFlush slow path takes the `bne` at `0x002ff9ac` and tail-
+calls the hook fn at `0x002ffdd8` (NOT the class table). Disasm of
+`0x002ffdd8` reveals validate-and-error pattern: cmpw qHead vs
+sentinel `*(0x008d951c) = 0x0099af68` and the workQ enqueue at
+`0x00302598` is gated behind a successful validate that fails for
+tFecEndRx. **Even if validation forced through**, SEM-CLASS2
+shows `class[7] = 0x00000000` in the second table at `0x008d95a4` —
+firmware has no wake fn registered for class 7. The "class byte"
+reading from `lbz 4(r31)` is actually a pointer fragment (top byte
+of qTail in 0x07xxxxxx range). Real class is likely encoded in the
+`[+0x0C] = 0x008d8fd4` vtable pointer (constant across all sems).
+See `SESSION_LOG_2026-05-08.md`. Realistic remaining:
 
 - **Gate 4 exercise** (small): switch netdev to allow host→guest traffic
   (`-hostfwd` or tap), drive an inbound packet, watch `BestComm RX:`
