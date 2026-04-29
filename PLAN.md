@@ -46,15 +46,19 @@ already zero from boot, gate-fn at `0x00100920` never called). Real
 Vestas-app spawn gate hunt in progress — see
 `SESSION_LOG_2026-04-30.md`.
 
-Rough progress to gate 12: **~40-45% (2026-05-04).** Gate 7 closed
+Rough progress to gate 12: **~40-45% (2026-05-05).** Gate 7 closed
 2026-05-03 (BSP reads real bytes from `/fs/`). Firedrake daemon
 family alive (35 tasks, was 21). Gate 8 partially advanced. Gate 9
 still half-closed — TCP handshake works, but byte-level comms with
 guest daemons does not: FEC RX frames now reach guest DRAM
 (force-armed BDs after 2026-05-04 workaround) but `tFecEndRx`
 stays PEND'd because the SDMA RX-done IRQ doesn't make the BSP
-take an EXT exception. `tApMain`/`tFirecrest` not yet seen by
-name. Realistic remaining:
+take an EXT exception. **2026-05-05:** Phase 0 diagnostics confirmed
+the BSP doesn't use a mask register to gate SDMA (MainMask 0x510 is
+0 = all enabled); Phase 1.B (edge re-trigger via 1→0→1 EXT pulse)
+did not crack dispatch. Next session: Phase 2.A (direct sem-poke
+of `0x07bee080` to wake tFecEndRx, bypass dispatch). `tApMain`/
+`tFirecrest` not yet seen by name. Realistic remaining:
 
 - **Gate 4 exercise** (small): switch netdev to allow host→guest traffic
   (`-hostfwd` or tap), drive an inbound packet, watch `BestComm RX:`
