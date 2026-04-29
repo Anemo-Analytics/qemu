@@ -116,6 +116,11 @@ void mpc5200_fec_send_packet(DeviceState *dev, const uint8_t *buf, size_t len);
  * triggering any host syscall. Used to verify that an instrumented BSP site
  * is actually being executed (e.g. the 0x13ffe4 existence-check stub). */
 #define FSHOOK_REG_TRACE     0x18
+/* Host->guest doorbell: QEMU writes a sem_id to wake; BSP reads it in the
+ * sysClkInt tail patch and calls semGive(sem_id), then writes 0 back to
+ * clear. Bypasses the MSR.EE=0 EXT-dispatch wall (2026-05-05 finding) by
+ * letting the BSP's own ~60 Hz clock ISR do the wake. */
+#define FSHOOK_REG_SEM_QUEUE 0x1C
 
 /* Command IDs — match the BSP-side stubs in mpc5200_apply_keyswitch_patches. */
 #define FS_OPEN   1
@@ -224,6 +229,7 @@ typedef struct {
         uint32_t arg0, arg1, arg2;
         uint32_t result;
         uint32_t err;
+        uint32_t sem_queue;          /* host->guest doorbell: sem_id to give */
         struct {
             int  host_fd;
             bool in_use;
@@ -532,13 +538,127 @@ static void mpc5200_apply_keyswitch_patches(void)
     };
     cpu_physical_memory_write(0x002acee8, printf_stub, sizeof(printf_stub));
 
+    /*
+     * sysClkInt tail-patch (semGive shim, plan 2026-05-06).
+     *
+     * 2026-05-05 confirmed MSR.EE=0 holds across the SDMA-pending window —
+     * EXT dispatch never reaches the SDMA Main ISR, so tFecEndRx never
+     * wakes via the normal IRQ path. Sidestep: have the BSP's own clock
+     * ISR call semGive on a doorbell flag we set from the QEMU IO thread
+     * after the RX walker delivers a frame.
+     *
+     * Patch site: replace the `bl 0x00138a7c` (intUnlock) at sysClkInt
+     * 0x001180b8 with a `bl` to a stub we install in the freed body of
+     * the no-op'd printf at 0x002acef0. The stub does the original
+     * intUnlock (so EE=1 again), then reads FSHOOK_REG_SEM_QUEUE; if
+     * non-zero, clears the flag and tail-calls semGive(sem_id).
+     *
+     * Public semGive @ 0x002ff5c4 — verified: byte-identical prologue to
+     * bootrom semGive, 686 direct callers in vxworks.out, name string at
+     * 0x003e67b0 referenced from runtime symtab record at 0x008fe080.
+     *
+     * intUnlock @ 0x00138a7c — verified: mfmsr; rlwinm clear EE; mtmsr;
+     * isync; blr (matches bootrom 0x010fXXXX intUnlock primitive).
+     *
+     * Stub layout (12 instructions, 48 bytes, at 0x002acef0):
+     *
+     *   +0x00  mflr  r12              ; save sysClkInt continuation
+     *   +0x04  bl    0x00138a7c       ; intUnlock (EE=1 again)
+     *   +0x08  lis   r10, 0xF000      ; r10 = SEM_QUEUE doorbell addr
+     *   +0x0C  ori   r10, r10, 0x401C
+     *   +0x10  lwz   r3,  0(r10)      ; r3 = pending sem_id
+     *   +0x14  mtlr  r12              ; pre-set LR for tail-call/blr
+     *   +0x18  cmpwi r3, 0
+     *   +0x1C  beq+  +0x10            ; skip if no sem (->+0x2c)
+     *   +0x20  li    r9, 0
+     *   +0x24  stw   r9,  0(r10)      ; clear flag BEFORE call
+     *   +0x28  b     0x002ff5c4       ; tail-call semGive (no link)
+     *   +0x2C  blr                    ; reached via beq when no sem
+     *
+     * r3, r9, r10, r12 are PPC ABI volatile (caller-saved). sysClkInt's
+     * code after the patch site reads only r26, r28, r30 (non-volatile)
+     * + reloads its scratch regs, so our clobbers are safe. r3 is
+     * overwritten at 0x001180f8 (`li r3, 0xf0`) so the saved-MSR returned
+     * by intUnlock is unused — same as the original `bl 0x138a7c`.
+     */
+    {
+        const uint32_t stub_addr     = 0x002acef0;
+        const uint32_t intunlock_addr = 0x00138a7c;
+        const uint32_t semgive_addr  = 0x002ff5c4;
+        const uint32_t patch_site    = 0x001180b8;
+
+        /* Encode bl/b: insn = 0x48000000 | (offset & 0x03FFFFFC) | LK. */
+        uint32_t bl_intunlock =
+            0x48000000u | ((intunlock_addr - (stub_addr + 0x04)) & 0x03FFFFFC) | 1u;
+        uint32_t b_semgive =
+            0x48000000u | ((semgive_addr  - (stub_addr + 0x28)) & 0x03FFFFFC);
+        uint32_t bl_to_stub =
+            0x48000000u | ((stub_addr     - patch_site)         & 0x03FFFFFC) | 1u;
+
+        const uint32_t stub_words[12] = {
+            0x7d8802a6,    /* +0x00  mflr  r12                              */
+            bl_intunlock,  /* +0x04  bl    0x00138a7c                       */
+            0x3d40f000,    /* +0x08  lis   r10, 0xF000                      */
+            0x614a401c,    /* +0x0C  ori   r10, r10, 0x401C                 */
+            0x806a0000,    /* +0x10  lwz   r3,  0(r10)                      */
+            0x7d8803a6,    /* +0x14  mtlr  r12                               */
+            0x2c030000,    /* +0x18  cmpwi r3, 0                            */
+            0x41820010,    /* +0x1C  beq   +0x10  (-> +0x2c)                */
+            0x39200000,    /* +0x20  li    r9, 0                            */
+            0x912a0000,    /* +0x24  stw   r9,  0(r10)                      */
+            b_semgive,     /* +0x28  b     0x002ff5c4 (tail-call, no link)  */
+            0x4e800020,    /* +0x2C  blr   (no-sem path)                    */
+        };
+        /* Convert to BE byte array for cpu_physical_memory_write. */
+        uint8_t stub_bytes[sizeof(stub_words)];
+        for (unsigned i = 0; i < ARRAY_SIZE(stub_words); i++) {
+            stub_bytes[i*4 + 0] = (stub_words[i] >> 24) & 0xFF;
+            stub_bytes[i*4 + 1] = (stub_words[i] >> 16) & 0xFF;
+            stub_bytes[i*4 + 2] = (stub_words[i] >>  8) & 0xFF;
+            stub_bytes[i*4 + 3] = (stub_words[i] >>  0) & 0xFF;
+        }
+        cpu_physical_memory_write(stub_addr, stub_bytes, sizeof(stub_bytes));
+
+        /* Patch sysClkInt: replace `bl 0x00138a7c` at 0x001180b8 with
+         * `bl <stub_addr>`. The original orig-bl encoding is 0x480209c5;
+         * the new encoding lands in stub_bytes layout above. */
+        uint8_t patch[4] = {
+            (bl_to_stub >> 24) & 0xFF,
+            (bl_to_stub >> 16) & 0xFF,
+            (bl_to_stub >>  8) & 0xFF,
+            (bl_to_stub >>  0) & 0xFF,
+        };
+        cpu_physical_memory_write(patch_site, patch, sizeof(patch));
+    }
+
+    /* Read-back verification: dump the patched bytes so we can confirm
+     * the writes landed (catches DRAM-mapping / read-only-region issues
+     * that would otherwise be silent). */
+    {
+        uint8_t v_site[4], v_stub[12];
+        cpu_physical_memory_read(0x001180b8, v_site, sizeof(v_site));
+        cpu_physical_memory_read(0x002acef0, v_stub, sizeof(v_stub));
+        fprintf(stderr,
+                "MPC5200: post-patch verify: 0x001180b8 = %02x%02x%02x%02x "
+                "(expect bl 0x002acef0 = 48194c39); "
+                "0x002acef0 = %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x "
+                "(expect mflr r12 = 7d8802a6, bl intUnlock = 4be8bb89, "
+                "lis r10,0xF000 = 3d40f000)\n",
+                v_site[0], v_site[1], v_site[2], v_site[3],
+                v_stub[0], v_stub[1], v_stub[2], v_stub[3],
+                v_stub[4], v_stub[5], v_stub[6], v_stub[7],
+                v_stub[8], v_stub[9], v_stub[10], v_stub[11]);
+    }
+
     fprintf(stderr,
             "MPC5200: applied CT296 KeySwitch bypass patches at 0x12d390, "
             "0x12ae60; force-zeroed app-spawn gate at 0x00962e2c; "
             "stubbed /fs/etc/startup.app existence check at 0x13ffe4; "
             "installed FS-hook hypercall stubs at open=0x2b13c8 "
             "read=0x2b18fc close=0x2b17d4 (doorbell @ 0xF0004000, root=%s); "
-            "no-op'd printf at 0x2acee8 (PSC1 TX IRQ workaround)\n",
+            "no-op'd printf at 0x2acee8 (PSC1 TX IRQ workaround); "
+            "installed sysClkInt tail-patch @ 0x001180b8 -> stub @ 0x002acef0 "
+            "(semGive shim for tFecEndRx wake; semGive @ 0x002ff5c4)\n",
             fshook_root());
     fflush(stderr);
 }
@@ -652,6 +772,14 @@ static BootStation g_boot_stations[] = {
      * is sem-post (Phase 2). If it never hits despite SDMA RAISE in the
      * eval log, the problem is dispatch (Phase 1). */
     { 0x00132854, 0x00132857, "VX: SDMA Main ISR entry (0x132854)",      false, 0 },
+
+    /* === sysClkInt tail-patch shim (plan 2026-05-06) ===
+     * Stub @ 0x002acef0 fires once per ~17 ms tick — first hit confirms
+     * patch is wired correctly. semGive @ 0x002ff5c4 fires only when
+     * the RX hook has set sem_queue — first hit there confirms the
+     * shim actually delivered a wake to the BSP scheduler. */
+    { 0x002acef0, 0x002acef3, "VX: sysClkInt tail-patch stub entry",     false, 0 },
+    { 0x002ff5c4, 0x002ff5c7, "VX: semGive entry (via shim)",            false, 0 },
 
     /* === usrRoot stall hunt (plan 2026-05-03) === */
     { 0x00107a08, 0x00107a0b, "VX: bl usrKernelCoreInit",                false, 0 },
@@ -1081,6 +1209,36 @@ static void mpc5200_tick(void *opaque)
      * 0x2=PEND, 0x4=DELAY, 0x6=PEND+TIMEOUT. The saved PC tells us
      * exactly which kernel routine each task is blocked in.
      */
+    /*
+     * Synthetic doorbell test (plan 2026-05-06, Step 5 verification).
+     *
+     * Fire BEFORE tFecEndRecover wakes at t≈14s (it runs m5200FecRestart
+     * which destroys tFecEndRx, per 2026-05-05 finding). At t=8s the BSP
+     * is at steady state with tFecEndRx PEND on 0x07bee080.
+     *
+     * Bypass the RX-hook path entirely: the sysClkInt tail-patch picks
+     * up the doorbell on its next tick (~17ms), tail-calls semGive on
+     * sem 0x07bee080, and tFecEndRx should leave PEND.
+     *
+     * Also: dump s->fshook.sem_queue once per second after the write —
+     * if the shim ran, it would have cleared the slot back to 0. A
+     * persistent non-zero value across multiple ticks means the shim
+     * is NOT running.
+     */
+    if (tick_count == 60 * 8) {
+        fprintf(stderr,
+                "SYNTH-DOORBELL: writing s->fshook.sem_queue = 0x07bee080 at "
+                "t=8s (pre-tFecEndRecover-kill) — expect tFecEndRx wake by t=9s\n");
+        fflush(stderr);
+        s->fshook.sem_queue = 0x07bee080;
+    }
+    if (tick_count >= 60 * 8 && tick_count <= 60 * 14 && (tick_count % 60) == 0) {
+        fprintf(stderr, "SYNTH-DOORBELL: t=%ds, s->fshook.sem_queue = 0x%08x "
+                "(0 means BSP shim cleared it)\n",
+                tick_count / 60, s->fshook.sem_queue);
+        fflush(stderr);
+    }
+
     if ((tick_count % 60) == 0 && tick_count <= 60 * 90) {
         AddressSpace *as = &address_space_memory;
         const uint32_t ACTIVEQ_HEAD = 0x008d94e4;
@@ -1423,12 +1581,13 @@ static uint64_t mpc5200_mmio_read(void *opaque, hwaddr offset, unsigned size)
     /* FS-hook doorbell read-back (Phase 4b): result/errno only. */
     if (offset >= FSHOOK_OFFSET && offset < FSHOOK_OFFSET + FSHOOK_REG_SIZE) {
         switch (offset - FSHOOK_OFFSET) {
-        case FSHOOK_REG_RESULT: return s->fshook.result;
-        case FSHOOK_REG_ERRNO:  return s->fshook.err;
-        case FSHOOK_REG_ARG0:   return s->fshook.arg0;
-        case FSHOOK_REG_ARG1:   return s->fshook.arg1;
-        case FSHOOK_REG_ARG2:   return s->fshook.arg2;
-        default:                return 0;
+        case FSHOOK_REG_RESULT:    return s->fshook.result;
+        case FSHOOK_REG_ERRNO:     return s->fshook.err;
+        case FSHOOK_REG_ARG0:      return s->fshook.arg0;
+        case FSHOOK_REG_ARG1:      return s->fshook.arg1;
+        case FSHOOK_REG_ARG2:      return s->fshook.arg2;
+        case FSHOOK_REG_SEM_QUEUE: return s->fshook.sem_queue;
+        default:                   return 0;
         }
     }
 
@@ -1876,6 +2035,20 @@ static void mpc5200_bestcomm_rx_hook(const uint8_t *buf, size_t len)
         mpc5200_bc_put32(s, 0x18, mask & ~BCOM_INTP_FEC_RX);
     }
     mpc5200_sdma_eval_irq(s);
+
+    /*
+     * Doorbell: tell the BSP to semGive(tFecEndRx_sem). The BSP's
+     * sysClkInt tail-patch (~60Hz) reads FSHOOK_REG_SEM_QUEUE on each
+     * tick and calls semGive when non-zero. Bypasses the MSR.EE=0 hold
+     * on EXT dispatch (2026-05-05 finding) entirely.
+     *
+     * Sem ID 0x07bee080: tFecEndRx PEND target, observed across all
+     * gate-9 dispatch experiments. Write is unconditional — if a prior
+     * tick already took the previous queue value, we just queue another
+     * give (semGive on a counting/binary sem is idempotent for our
+     * purposes; tFecEndRx will wake on the first non-stale give).
+     */
+    s->fshook.sem_queue = 0x07bee080;
 }
 
 /* Forward decl for the FEC -> BestComm RX hook installer. */
@@ -1907,6 +2080,22 @@ static void mpc5200_mmio_write(void *opaque, hwaddr offset,
                 fprintf(stderr, "FS_HOOK: TRACE <bad ptr 0x%08x>\n", v);
             }
             fflush(stderr);
+            return;
+        }
+        case FSHOOK_REG_SEM_QUEUE: {
+            /* BSP-side sysClkInt tail patch reads this, calls semGive on a
+             * non-zero value, and writes 0 back to clear. Logged once per
+             * non-zero queue + once per BSP clear so we can correlate with
+             * tFecEndRx wakes. */
+            static unsigned sq_log = 0;
+            if (sq_log++ < 64) {
+                fprintf(stderr, "FS_HOOK: SEM_QUEUE write 0x%08x "
+                        "(NIP=0x%08x LR=0x%08x)\n",
+                        v, (unsigned)s->cpu->env.nip,
+                        (unsigned)s->cpu->env.lr);
+                fflush(stderr);
+            }
+            s->fshook.sem_queue = v;
             return;
         }
         default:                return;
