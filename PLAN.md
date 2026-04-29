@@ -46,12 +46,15 @@ already zero from boot, gate-fn at `0x00100920` never called). Real
 Vestas-app spawn gate hunt in progress — see
 `SESSION_LOG_2026-04-30.md`.
 
-Rough progress to gate 12: **~20-25%.** We have the hardware
-emulation (gates 0-3) plus a kernel that boots into a non-app idle
-state. The Vestas turbine application (`tApMain`, `tFirecrest`,
-`tFiredrake`, `tNeon`) is **not** running — those tasks aren't in
-the live task list. So the work between here and gate 12 is bigger
-than the 1-2 weeks for "gates 4-6" suggested. Realistic remaining:
+Rough progress to gate 12: **~40-45% (2026-05-04).** Gate 7 closed
+2026-05-03 (BSP reads real bytes from `/fs/`). Firedrake daemon
+family alive (35 tasks, was 21). Gate 8 partially advanced. Gate 9
+still half-closed — TCP handshake works, but byte-level comms with
+guest daemons does not: FEC RX frames now reach guest DRAM
+(force-armed BDs after 2026-05-04 workaround) but `tFecEndRx`
+stays PEND'd because the SDMA RX-done IRQ doesn't make the BSP
+take an EXT exception. `tApMain`/`tFirecrest` not yet seen by
+name. Realistic remaining:
 
 - **Gate 4 exercise** (small): switch netdev to allow host→guest traffic
   (`-hostfwd` or tap), drive an inbound packet, watch `BestComm RX:`
