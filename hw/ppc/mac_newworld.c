@@ -128,6 +128,7 @@ void mpc5200_fec_send_packet(DeviceState *dev, const uint8_t *buf, size_t len);
 #define FS_CLOSE  3
 #define FS_LSEEK  4
 #define FS_FSTAT  5
+#define FS_EXISTS 6
 
 #define FSHOOK_NUM_FDS       16
 #define FSHOOK_FAKE_FD_BASE  1000  /* fake fds returned to BSP: 1000..1015 */
@@ -452,19 +453,12 @@ static void mpc5200_apply_keyswitch_patches(void)
      *
      * The function never set up its stack frame yet, so a bare blr is safe.
      */
-    /* fs_exists stub now traces through the FS-hook doorbell so we know
-     * when (and with what path) the existence helper actually fires. The
-     * existing real body at 0x13ffe4 is 9 instructions (36 bytes) — same
-     * size as our hypercall stubs — so we have room. */
-    static const uint8_t fs_exists_stub[24] = {
-        0x3d, 0x80, 0xf0, 0x00,   /* lis  r12, 0xF000              */
-        0x61, 0x8c, 0x40, 0x18,   /* ori  r12, r12, 0x4018         */
-        0x90, 0x6c, 0x00, 0x00,   /* stw  r3, 0(r12)  -> TRACE     */
-        0x38, 0x60, 0x00, 0x01,   /* li   r3, 1                    */
-        0x4e, 0x80, 0x00, 0x20,   /* blr                            */
-        0x60, 0x00, 0x00, 0x00,   /* nop (pad)                      */
-    };
-    cpu_physical_memory_write(0x0013ffe4, fs_exists_stub, sizeof(fs_exists_stub));
+    /* fs_exists hypercall (plan 2026-05-08, Track 2). Replaced the
+     * earlier "always return 1" trace stub with a real FS_EXISTS
+     * hypercall: the BSP now gets an honest -1/+1 from access(F_OK).
+     * Body at 0x13ffe4 is 9 instructions (36 bytes) — same size as
+     * our open/read/close hypercall stubs — installed below in the
+     * shared template block alongside FS_OPEN/READ/CLOSE. */
 
     /*
      * Phase 4b (2026-05-02): hypercall stubs at the BSP's open/read/close
@@ -508,6 +502,12 @@ static void mpc5200_apply_keyswitch_patches(void)
         cpu_physical_memory_write(0x002b18fc, stub, sizeof(stub));
         stub[23] = FS_CLOSE;
         cpu_physical_memory_write(0x002b17d4, stub, sizeof(stub));
+        /* fs_exists at 0x13ffe4 — same template, FS_EXISTS cmd. The
+         * BSP-level body uses fopen("/fs/<path>", "r") to test for
+         * existence; our hypercall delegates to host access(F_OK)
+         * via fshook_handle_exists. */
+        stub[23] = FS_EXISTS;
+        cpu_physical_memory_write(0x0013ffe4, stub, sizeof(stub));
     }
 
     /*
@@ -660,9 +660,9 @@ static void mpc5200_apply_keyswitch_patches(void)
     fprintf(stderr,
             "MPC5200: applied CT296 KeySwitch bypass patches at 0x12d390, "
             "0x12ae60; force-zeroed app-spawn gate at 0x00962e2c; "
-            "stubbed /fs/etc/startup.app existence check at 0x13ffe4; "
             "installed FS-hook hypercall stubs at open=0x2b13c8 "
-            "read=0x2b18fc close=0x2b17d4 (doorbell @ 0xF0004000, root=%s); "
+            "read=0x2b18fc close=0x2b17d4 exists=0x13ffe4 "
+            "(doorbell @ 0xF0004000, root=%s); "
             "no-op'd printf at 0x2acee8 (PSC1 TX IRQ workaround); "
             "installed sysClkInt tail-patch @ 0x001180b8 -> stub @ 0x002acef0 "
             "(semGive shim for tFecEndRx wake; tail-calls semFlush @ 0x002ff884)\n",
@@ -1330,6 +1330,78 @@ static void mpc5200_tick(void *opaque)
                     b0);
         }
         fflush(stderr);
+
+        /*
+         * Step 1.A (gate-9 follow-up, plan 2026-05-08): dump the class
+         * dispatch table semFlush walks at 0x002ff9a0. Disasm:
+         *   lbz   r0, 4(r31)                ; class byte from sem_id+4
+         *   rlwinm r0, r0, 2, 0x1b, 0x1d    ; (class << 2) & 0x1c
+         *   lwzx  r0, r9, r0                ; r0 = *(table_base + idx*4)
+         * with r9 = 0x008d9564 (FIRST table base, used by class-table
+         * dispatch when *(0x0090879c) == 0). The hook fn at 0x002ffdd8
+         * (called when *(0x0090879c) != 0) uses a SECOND table at
+         * 0x008d95a4 — dumped below as SEM-CLASS2.
+         */
+        const uint32_t class_base  = 0x008d9564;
+        const uint32_t class2_base = 0x008d95a4;
+        fprintf(stderr,
+                "SEM-CLASS: 1st-table base = 0x%08x  (used by semFlush "
+                "class-table dispatch at 0x002ff9b0..d0)\n", class_base);
+        for (int i = 0; i < 8; i++) {
+            uint32_t addr = class_base + i * 4;
+            uint32_t fn   = ldl_be_phys(as, addr);
+            fprintf(stderr,
+                    "SEM-CLASS:   class[%d] @ 0x%08x = 0x%08x\n",
+                    i, addr, fn);
+        }
+        fprintf(stderr,
+                "SEM-CLASS2: 2nd-table base = 0x%08x  (used by hook fn "
+                "0x002ffdd8 dispatch at 0x002ffe2c after validation)\n",
+                class2_base);
+        for (int i = 0; i < 8; i++) {
+            uint32_t addr = class2_base + i * 4;
+            uint32_t fn   = ldl_be_phys(as, addr);
+            fprintf(stderr,
+                    "SEM-CLASS2:  class[%d] @ 0x%08x = 0x%08x\n",
+                    i, addr, fn);
+        }
+        /* Sentinel the hook fn compares qHead against. *(0x008d951c) is
+         * loaded as r9, then r9+0x24 is also compared. Two values
+         * sufficient to reproduce the validation logic in next session. */
+        uint32_t sent      = ldl_be_phys(as, 0x008d951c);
+        uint32_t sent_p24  = (sent && sent < 0x10000000)
+                                ? ldl_be_phys(as, sent + 0x24) : 0;
+        fprintf(stderr,
+                "SEM-SENTINEL: *(0x008d951c) = 0x%08x ; "
+                "*(sentinel+0x24) = 0x%08x  (qHead must equal one of "
+                "these or the hook fn errors out)\n", sent, sent_p24);
+
+        /*
+         * Step 1.C (gate-9 follow-up): dump the BSS-resident sem
+         * controls semFlush reads on its slow path. Sign-extension on
+         *   lis r9, 0x91 ; lwz rN, -<imm>(r9)
+         * gives us r9 = 0x00910000 and the addresses below by adding
+         * (signed) the lwz offset to r9.
+         *   0x008d5c60  kernelState (0 = scheduler dispatch direct)
+         *   0x0090879c  sem global #1 (0x910000-0x7864)
+         *   0x009083e8  sem global #2 (0x910000-0x7c18)
+         *   0x008f8388  workQueue control byte (one we already read)
+         */
+        struct { uint32_t addr; const char *name; } globals[] = {
+            { 0x008d5c60, "kernelState" },
+            { 0x0091879c, "sem-glob-91879c"   },
+            { 0x0090879c, "sem-glob-90879c"   },
+            { 0x009083e8, "sem-glob-9083e8"   },
+            { 0x008f8388, "workQ-ctl-8f8388"  },
+            { 0x0091877c, "sem-glob-91877c"   },
+        };
+        for (int i = 0; i < (int)ARRAY_SIZE(globals); i++) {
+            uint32_t v = ldl_be_phys(as, globals[i].addr);
+            fprintf(stderr,
+                    "SEM-GLOBALS: 0x%08x %-22s = 0x%08x\n",
+                    globals[i].addr, globals[i].name, v);
+        }
+        fflush(stderr);
     }
 
     /*
@@ -1692,14 +1764,59 @@ static void fshook_handle_fstat(MPC5200State *s)
     fflush(stderr);
 }
 
+/* exists: translate guest path to host, run access(F_OK), return 1 on hit
+ * and 0 on miss. Mirrors fshook_handle_open's path-validation path; never
+ * allocates an fd slot. The BSP body at 0x13ffe4 used fopen() for the
+ * same purpose; access() is cheaper and gives the BSP an honest miss when
+ * the host file is absent (e.g. /fs/etc/force_safe_mode). */
+static void fshook_handle_exists(MPC5200State *s)
+{
+    char vx_path[256];
+    char host_path[512];
+
+    if (!fshook_read_guest_path(s->fshook.arg0, vx_path, sizeof(vx_path))) {
+        s->fshook.result = 0;
+        s->fshook.err    = EINVAL;
+        fprintf(stderr, "FS_HOOK: exists(<bad ptr 0x%08x>) -> 0\n",
+                s->fshook.arg0);
+        fflush(stderr);
+        return;
+    }
+    if (!fshook_translate(vx_path, host_path, sizeof(host_path))) {
+        s->fshook.result = 0;
+        s->fshook.err    = ENOENT;
+        fprintf(stderr,
+                "FS_HOOK: exists(\"%s\") -> 0 (path not under /fs/)\n",
+                vx_path);
+        fflush(stderr);
+        return;
+    }
+    int rc = access(host_path, F_OK);
+    if (rc == 0) {
+        s->fshook.result = 1;
+        s->fshook.err    = 0;
+        fprintf(stderr, "FS_HOOK: exists(\"%s\") -> 1  (host=\"%s\")\n",
+                vx_path, host_path);
+    } else {
+        int saved = errno;
+        s->fshook.result = 0;
+        s->fshook.err    = saved;
+        fprintf(stderr,
+                "FS_HOOK: exists(\"%s\") -> 0  (host=\"%s\": %s)\n",
+                vx_path, host_path, strerror(saved));
+    }
+    fflush(stderr);
+}
+
 static void fshook_dispatch(MPC5200State *s, uint32_t cmd)
 {
     switch (cmd) {
-    case FS_OPEN:  fshook_handle_open(s);  return;
-    case FS_READ:  fshook_handle_read(s);  return;
-    case FS_CLOSE: fshook_handle_close(s); return;
-    case FS_LSEEK: fshook_handle_lseek(s); return;
-    case FS_FSTAT: fshook_handle_fstat(s); return;
+    case FS_OPEN:   fshook_handle_open(s);   return;
+    case FS_READ:   fshook_handle_read(s);   return;
+    case FS_CLOSE:  fshook_handle_close(s);  return;
+    case FS_LSEEK:  fshook_handle_lseek(s);  return;
+    case FS_FSTAT:  fshook_handle_fstat(s);  return;
+    case FS_EXISTS: fshook_handle_exists(s); return;
     default:
         s->fshook.result = (uint32_t)-1;
         s->fshook.err    = ENOSYS;
