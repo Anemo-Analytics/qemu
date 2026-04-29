@@ -257,6 +257,23 @@ static void mpc5200_update_ext(MPC5200State *s)
 {
     int lvl = (s->ic_pending || s->ic_fec_pending || s->ic_sdma_pending)
               ? 1 : 0;
+    static int prev = -1;
+    static unsigned ext_log = 0;
+    /* Log first 32, then every 100th, then any with sdma=1. */
+    bool log_this = (ext_log < 32) ||
+                    (s->ic_sdma_pending && lvl == 1) ||
+                    (ext_log % 100 == 0);
+    if (lvl != prev && log_this && ext_log < 200) {
+        fprintf(stderr,
+                "EXT line %d->%d (slt=%d fec=%d sdma=%d) #%u\n",
+                prev, lvl, s->ic_pending, s->ic_fec_pending,
+                s->ic_sdma_pending, ext_log);
+        fflush(stderr);
+    }
+    if (lvl != prev) {
+        ext_log++;
+        prev = lvl;
+    }
     ppc_set_irq(s->cpu, PPC_INTERRUPT_EXT, lvl);
 }
 
@@ -298,16 +315,16 @@ static void mpc5200_sdma_eval_irq(MPC5200State *s)
     uint32_t mask = mpc5200_bc_get32(s, 0x18);
     bool was_pending = s->ic_sdma_pending;
     s->ic_sdma_pending = (intp & ~mask) != 0;
-    if (s->ic_sdma_pending != was_pending) {
-        static unsigned log = 0;
-        if (log++ < 32) {
-            fprintf(stderr,
-                    "SDMA IRQ %s: IntPending=0x%08x IntMask=0x%08x "
-                    "unmasked=0x%08x\n",
-                    s->ic_sdma_pending ? "RAISE" : "CLEAR",
-                    intp, mask, intp & ~mask);
-            fflush(stderr);
-        }
+    static unsigned log = 0;
+    if (log++ < 64) {
+        fprintf(stderr,
+                "SDMA eval: IntPending=0x%08x IntMask=0x%08x unmasked=0x%08x "
+                "%s\n",
+                intp, mask, intp & ~mask,
+                s->ic_sdma_pending != was_pending
+                    ? (s->ic_sdma_pending ? "RAISE" : "CLEAR")
+                    : "(no change)");
+        fflush(stderr);
     }
     mpc5200_update_ext(s);
 }
@@ -1428,19 +1445,35 @@ static uint64_t mpc5200_mmio_read(void *opaque, hwaddr offset, unsigned size)
      * we re-report it.
      */
     if (offset == 0x0524) {
+        uint32_t v = 0;
+        const char *src = "none";
         if (s->ic_fec_pending) {
-            return 0x25240000;
-        }
-        if (s->ic_sdma_pending) {
-            return 0x20000000;
-        }
-        if (s->ic_pending) {
+            v = 0x25240000;
+            src = "FEC";
+        } else if (s->ic_sdma_pending) {
+            v = 0x20000000;
+            src = "SDMA";
+        } else if (s->ic_pending) {
             /* SLT1 timer — legacy path; read-to-clear. */
             s->ic_pending = false;
             mpc5200_update_ext(s);
-            return 0x40000000;
+            v = 0x40000000;
+            src = "SLT1";
         }
-        return 0;
+        static unsigned pst_log = 0;
+        /* Always log non-zero non-SLT reads (FEC + SDMA dispatch),
+         * but rate-limit SLT to avoid swamping. */
+        bool log_it = (v != 0 && strcmp(src, "SLT1") != 0)
+                      || (pst_log < 64);
+        if (log_it && pst_log < 4096) {
+            fprintf(stderr, "IC 0x524 read => 0x%08x (%s) "
+                    "(fec=%d sdma=%d slt=%d)\n",
+                    v, src, s->ic_fec_pending, s->ic_sdma_pending,
+                    s->ic_pending);
+            fflush(stderr);
+        }
+        pst_log++;
+        return v;
     }
 
     /* BestComm/SDMA register file: byte-addressable RAM. Big-endian. */
@@ -1743,11 +1776,39 @@ static void mpc5200_bestcomm_rx_hook(const uint8_t *buf, size_t len)
     uint32_t skb_pa  = ldl_be_phys(&address_space_memory, bd_addr + 4);
 
     if (!(status & BCOM_BD_READY)) {
-        fprintf(stderr,
-                "BestComm RX: BD[start=0x%08x] not READY, dropping %zu B\n",
-                bd_addr, len);
-        fflush(stderr);
-        return;
+        /*
+         * BSP allocated skb buffers (data field is set to a DRAM addr) but
+         * never wrote BCOM_BD_READY. The kernel task tFecEndRx that would
+         * arm the ring is PEND'd at PC=0x2fe918 from boot — so the ring
+         * stays half-initialised and we drop every inbound frame.
+         *
+         * Workaround (Phase 2.3): if skb_pa points into DRAM, treat the BD
+         * as engine-owned and deliver the frame anyway. The frame write +
+         * status (L | len) + raised RXF IRQ should wake tFecEndRx, which
+         * will then re-arm the ring properly going forward.
+         */
+        bool skb_valid = (skb_pa >= 0x00100000 && skb_pa < 0x10000000);
+        if (!skb_valid) {
+            static unsigned drop_log = 0;
+            if (drop_log++ < 8) {
+                fprintf(stderr,
+                        "BestComm RX: BD[start=0x%08x status=0x%08x skb=0x%08x] "
+                        "not READY, no valid skb, dropping %zu B "
+                        "(base=0x%08x last=0x%08x)\n",
+                        bd_addr, status, skb_pa, len, bd_base, bd_last);
+                fflush(stderr);
+            }
+            return;
+        }
+        static unsigned forge_log = 0;
+        if (forge_log++ < 16) {
+            fprintf(stderr,
+                    "BestComm RX: BD[start=0x%08x] not READY but skb=0x%08x "
+                    "valid — force-arming and delivering %zu B "
+                    "(base=0x%08x last=0x%08x)\n",
+                    bd_addr, skb_pa, len, bd_base, bd_last);
+            fflush(stderr);
+        }
     }
 
     fprintf(stderr,
@@ -1774,11 +1835,18 @@ static void mpc5200_bestcomm_rx_hook(const uint8_t *buf, size_t len)
 
     /*
      * Set SDMA IntPending bit 3 (FEC RX = task 3) and re-evaluate.
-     * BSP unmasks bit 3 in IntMask when the RX task is enabled; this
-     * fires the SDMA Main ISR which dispatches to the FEC RX callback.
+     * BSP enables bit 3 in IntMask briefly during task init, then masks
+     * it again before tFecEndRx ever runs (because tFecEndRx is PEND'd
+     * waiting on a sem that's posted by the very IRQ we're trying to
+     * deliver). To break the deadlock, also force-unmask bit 3 here so
+     * the SDMA Main IRQ actually fires when a packet arrives.
      */
     uint32_t intp = mpc5200_bc_get32(s, 0x14);
+    uint32_t mask = mpc5200_bc_get32(s, 0x18);
     mpc5200_bc_put32(s, 0x14, intp | BCOM_INTP_FEC_RX);
+    if (mask & BCOM_INTP_FEC_RX) {
+        mpc5200_bc_put32(s, 0x18, mask & ~BCOM_INTP_FEC_RX);
+    }
     mpc5200_sdma_eval_irq(s);
 }
 

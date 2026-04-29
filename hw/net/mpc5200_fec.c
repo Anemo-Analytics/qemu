@@ -184,6 +184,16 @@ void mpc5200_fec_raise_eir(DeviceState *dev, uint32_t bits)
 {
     MPC5200FECState *s = MPC5200_FEC(dev);
     s->regs[FEC_EIR / 4] |= bits;
+    static unsigned raise_log = 0;
+    if (raise_log++ < 16) {
+        fprintf(stderr,
+                "FEC raise_eir bits=0x%08x EIR=0x%08x EIMR=0x%08x active=%d\n",
+                bits,
+                s->regs[FEC_EIR / 4],
+                s->regs[FEC_EIMR / 4],
+                (s->regs[FEC_EIR / 4] & s->regs[FEC_EIMR / 4]) != 0);
+        fflush(stderr);
+    }
     mpc5200_fec_update_irq(s);
 }
 
