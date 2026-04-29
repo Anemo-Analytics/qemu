@@ -625,6 +625,13 @@ static BootStation g_boot_stations[] = {
     { 0x002b13c8, 0x002b13cb, "VX: open() entry",                        false, 0 },
     { 0x002a5508, 0x002a550b, "VX: fopen() entry",                       false, 0 },
 
+    /* === SDMA Main ISR (plan 2026-05-05, gate 9 dispatch hunt) ===
+     * intConnect(0, 0x132854, ...) at 0x1329a0 registers the SDMA Main
+     * ISR. If this station hits, EXT dispatch reaches the ISR — problem
+     * is sem-post (Phase 2). If it never hits despite SDMA RAISE in the
+     * eval log, the problem is dispatch (Phase 1). */
+    { 0x00132854, 0x00132857, "VX: SDMA Main ISR entry (0x132854)",      false, 0 },
+
     /* === usrRoot stall hunt (plan 2026-05-03) === */
     { 0x00107a08, 0x00107a0b, "VX: bl usrKernelCoreInit",                false, 0 },
     { 0x00107a14, 0x00107a17, "VX: bl memInit",                          false, 0 },
@@ -1891,8 +1898,38 @@ static void mpc5200_mmio_write(void *opaque, hwaddr offset,
      * sensitive sources that clear when their underlying IRQ register
      * (FEC EIR / SDMA IntPending) is acked by the BSP. Spurious clears
      * would silently drop FEC TX/RX completion IRQs.
+     *
+     * Per-offset logging (plan 2026-05-05 Phase 0.3): we currently
+     * swallow PerMask (0x500), MainMask (0x510), CritMask (0x520)
+     * silently. If the BSP wrote a non-zero mask there it could be
+     * gating SDMA dispatch. Log the first 64 writes per offset so we
+     * see which registers the BSP actually touches.
      */
     if (offset >= 0x0500 && offset <= 0x052c) {
+        static unsigned ic_w_log[0x30 / 4];
+        unsigned slot = (offset - 0x500) / 4;
+        if (slot < ARRAY_SIZE(ic_w_log) && ic_w_log[slot]++ < 64) {
+            const char *name = "?";
+            switch (offset) {
+            case 0x500: name = "PerMask";      break;
+            case 0x504: name = "PerPri+Main";  break;
+            case 0x508: name = "MainPri1";     break;
+            case 0x50c: name = "MainPri2";     break;
+            case 0x510: name = "MainMask";     break;
+            case 0x514: name = "MainEnStat";   break;
+            case 0x518: name = "Crit*";        break;
+            case 0x51c: name = "Critx";        break;
+            case 0x520: name = "PerEnable";    break;
+            case 0x524: name = "PerStatEnc";   break;
+            case 0x528: name = "PerErrSt";     break;
+            case 0x52c: name = "MainStatEnc";  break;
+            }
+            fprintf(stderr,
+                    "IC W +0x%03x (%s) = 0x%08x sz=%u  NIP=0x%08x LR=0x%08x\n",
+                    (unsigned)offset, name, (unsigned)value, size,
+                    (unsigned)s->cpu->env.nip, (unsigned)s->cpu->env.lr);
+            fflush(stderr);
+        }
         s->ic_pending = false;
         mpc5200_update_ext(s);
         return;
