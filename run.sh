@@ -18,7 +18,8 @@ timeout "${TIMEOUT}" ./build/qemu-system-ppc \
     -nic user,id=n0,model=mpc5200-fec,mac=00:1b:f0:00:00:0a,\
 net=169.254.254.0/24,host=169.254.254.252,\
 hostfwd=tcp::2121-:21,hostfwd=tcp::2049-:2049,\
-hostfwd=tcp::3111-:111,hostfwd=tcp::17185-:17185 \
+hostfwd=tcp::3111-:111,hostfwd=tcp::17185-:17185,\
+hostfwd=tcp::9482-:9482,hostfwd=tcp::8080-:8080 \
     -object filter-dump,id=f0,netdev=n0,file="${PCAP}" \
     -display none -serial null \
     2>"${LOG}"
