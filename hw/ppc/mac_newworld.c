@@ -318,9 +318,52 @@ static void mpc5200_apply_keyswitch_patches(void)
      */
     stl_be_phys(&address_space_memory, 0x00962e2c, 0);
 
+    /*
+     * Filesystem-gate bypass (plan 2026-05-01).
+     *
+     * The BSP boots cleanly, then in usrAppInit-equivalent code it calls
+     * a file-existence helper at 0x0013ffe4 with arg "/fs/etc/startup.app"
+     * to decide whether the runmode startup script exists. Helper body:
+     *
+     *   13ffe4: stwu  r1,-16(r1)
+     *   13ffe8: lis   r4, 62               ; r4 = 0x3DBAC0 = "r" (mode)
+     *   13ffec: mflr  r0
+     *   13fff0: addi  r4, r4, -17728
+     *   13fff4: stw   r0, 20(r1)
+     *   13fff8: bl    0x2a5508             ; fopen(path, "r") -> r3 = FILE*
+     *   13fffc: cmpwi cr7, r3, 0
+     *   140000: bt    eq, 0x14001c          ; null -> return 0
+     *   140004: bl    0x2a4cac              ; fclose(FILE*)
+     *   140008: li    r3, 1                 ; success
+     *   ... epilogue, return r3
+     *
+     * Because we have no /fs/ filesystem mounted (no MPC5200 ATA model),
+     * the real fopen returns NULL and the BSP loops on
+     *   "Cannot find startup.app in runmode !"
+     * for 8 retries before giving up to bootmode idle.
+     *
+     * Stub the helper to always return 1. This makes the BSP take the
+     * success path that prints "Executing startup script /fs/etc/startup.app"
+     * and calls the script-runner at 0x001061c0. The runner will still
+     * fail (real open() also has no FS), but flipping this single check
+     * proves the gate-7 mechanism end-to-end and unblocks Phase 4b
+     * (full host-fs hook subsystem with open/read/close proxy).
+     *
+     *   13ffe4: 38 60 00 01    li r3, 1
+     *   13ffe8: 4e 80 00 20    blr
+     *
+     * The function never set up its stack frame yet, so a bare blr is safe.
+     */
+    static const uint8_t fs_exists_stub[8] = {
+        0x38, 0x60, 0x00, 0x01,   /* li   r3, 1     */
+        0x4e, 0x80, 0x00, 0x20,   /* blr            */
+    };
+    cpu_physical_memory_write(0x0013ffe4, fs_exists_stub, 8);
+
     fprintf(stderr,
             "MPC5200: applied CT296 KeySwitch bypass patches at 0x12d390, "
-            "0x12ae60; force-zeroed app-spawn gate at 0x00962e2c\n");
+            "0x12ae60; force-zeroed app-spawn gate at 0x00962e2c; "
+            "stubbed /fs/etc/startup.app existence check at 0x13ffe4\n");
     fflush(stderr);
 }
 
@@ -417,6 +460,15 @@ static BootStation g_boot_stations[] = {
     { 0x001009e0, 0x001009e3, "VX: gate-check branch (skip if !=0)",     false, 0 },
     { 0x001009e4, 0x001009ef, "VX: gate-pass (sets *(0x95a5a0)=1)",      false, 0 },
     { 0x0014adc0, 0x0014adc3, "VX: error-print xref to 0x962e2c",        false, 0 },
+
+    /* === FS gate (plan 2026-05-01) === */
+    { 0x0013ffe4, 0x0013ffe7, "VX: fs-exists check entry (stubbed)",     false, 0 },
+    { 0x0014c7d4, 0x0014c7d7, "VX: startup-loop call to fs-exists",      false, 0 },
+    { 0x0014c7ec, 0x0014c7ef, "VX: startup-loop SUCCESS branch",         false, 0 },
+    { 0x0014c828, 0x0014c82b, "VX: startup-loop FAILURE branch (Cannot find)", false, 0 },
+    { 0x001061c0, 0x001061c3, "VX: script-runner entry (post-banner)",   false, 0 },
+    { 0x002b13c8, 0x002b13cb, "VX: open() entry",                        false, 0 },
+    { 0x002a5508, 0x002a550b, "VX: fopen() entry",                       false, 0 },
 };
 
 /* NIP histogram across full bootrom .text — reveals idle loops. */
@@ -429,7 +481,7 @@ static void mpc5200_diag_sample(void *opaque)
 {
     MPC5200State *s = opaque;
     static int  diag_count = 0;
-    const int   diag_max   = 30000;  /* 30000 × 100us = 3 s of virtual time */
+    const int   diag_max   = 600000; /* 600000 × 100us = 60 s of virtual time */
     int         i;
 
     target_ulong nip = s->cpu->env.nip;
