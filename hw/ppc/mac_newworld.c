@@ -466,12 +466,41 @@ static void mpc5200_apply_keyswitch_patches(void)
         cpu_physical_memory_write(0x002b17d4, stub, sizeof(stub));
     }
 
+    /*
+     * printf no-op (plan 2026-05-03, Phase C).
+     *
+     * Phase A (stack-walk on tRootTask) showed usrToolsInit @ 0x107a4c
+     * → 0x1076b0 → 0x106594 (banner printer) blocking on the third call
+     * to printf at 0x2acee8. The deep call chain into iosWrite ends at
+     * a kernel sem block (PC=0x2fe918) that's only posted by a PSC1
+     * TX-empty IRQ — and our PSC1 emulation never raises one (no IRQ
+     * wiring). Two earlier printfs went through (probably small enough
+     * to fit a buffer); the third blocks waiting for drain.
+     *
+     * The fully correct fix is to wire PSC1 IRQs to fire on TX writes;
+     * scope creep for this session. Pragmatic alternative: turn printf
+     * itself into a no-op so the BSP's printf-heavy code can complete.
+     * We lose log output, but PSC1 W +0x0c|+0x40 echo path stays for
+     * any direct-to-UART writes (sysSerialHwInit etc.).
+     *
+     *   2acee8: 38 60 00 00    li  r3, 0
+     *   2acee8: 4e 80 00 20    blr
+     *
+     * Function never set up its frame yet, so a bare li/blr is safe.
+     */
+    static const uint8_t printf_stub[8] = {
+        0x38, 0x60, 0x00, 0x00,   /* li  r3, 0                      */
+        0x4e, 0x80, 0x00, 0x20,   /* blr                            */
+    };
+    cpu_physical_memory_write(0x002acee8, printf_stub, sizeof(printf_stub));
+
     fprintf(stderr,
             "MPC5200: applied CT296 KeySwitch bypass patches at 0x12d390, "
             "0x12ae60; force-zeroed app-spawn gate at 0x00962e2c; "
             "stubbed /fs/etc/startup.app existence check at 0x13ffe4; "
             "installed FS-hook hypercall stubs at open=0x2b13c8 "
-            "read=0x2b18fc close=0x2b17d4 (doorbell @ 0xF0004000, root=%s)\n",
+            "read=0x2b18fc close=0x2b17d4 (doorbell @ 0xF0004000, root=%s); "
+            "no-op'd printf at 0x2acee8 (PSC1 TX IRQ workaround)\n",
             fshook_root());
     fflush(stderr);
 }
@@ -578,6 +607,26 @@ static BootStation g_boot_stations[] = {
     { 0x001061c0, 0x001061c3, "VX: script-runner entry (post-banner)",   false, 0 },
     { 0x002b13c8, 0x002b13cb, "VX: open() entry",                        false, 0 },
     { 0x002a5508, 0x002a550b, "VX: fopen() entry",                       false, 0 },
+
+    /* === usrRoot stall hunt (plan 2026-05-03) === */
+    { 0x00107a08, 0x00107a0b, "VX: bl usrKernelCoreInit",                false, 0 },
+    { 0x00107a14, 0x00107a17, "VX: bl memInit",                          false, 0 },
+    { 0x00107a18, 0x00107a1b, "VX: bl wncan_core_init",                  false, 0 },
+    { 0x00107a24, 0x00107a27, "VX: bl memPartLibInit",                   false, 0 },
+    { 0x00107a28, 0x00107a2b, "VX: bl usrMmuInit",                       false, 0 },
+    { 0x00107a2c, 0x00107a2f, "VX: bl sysClkInit",                       false, 0 },
+    { 0x00107a34, 0x00107a37, "VX: bl selectInit",                       false, 0 },
+    { 0x00107a38, 0x00107a3b, "VX: bl usrIosCoreInit",                   false, 0 },
+    { 0x00107a3c, 0x00107a3f, "VX: bl usrKernelExtraInit",               false, 0 },
+    { 0x00107a40, 0x00107a43, "VX: bl usrIosExtraInit",                  false, 0 },
+    { 0x00107a44, 0x00107a47, "VX: bl usrNetworkInit",                   false, 0 },
+    { 0x00107a48, 0x00107a4b, "VX: bl selTaskDeleteHookAdd",             false, 0 },
+    { 0x00107a4c, 0x00107a4f, "VX: bl usrToolsInit",                     false, 0 },
+    { 0x00107a50, 0x00107a53, "VX: bl cplusCtorsLink",                   false, 0 },
+    { 0x00107a54, 0x00107a57, "VX: bl wn_mpc5200Can_init",               false, 0 },
+    { 0x00107a58, 0x00107a5b, "VX: bl wncan_attach",                     false, 0 },
+    { 0x00107a5c, 0x00107a5f, "VX: bl usrAppInit",                       false, 0 },
+    { 0x00107a68, 0x00107a6b, "VX: bl usrStartupScript",                 false, 0 },
 };
 
 /* NIP histogram across full bootrom .text — reveals idle loops. */
@@ -591,7 +640,20 @@ static void mpc5200_diag_sample(void *opaque)
     MPC5200State *s = opaque;
     static int  diag_count = 0;
     const int   diag_max   = 600000; /* 600000 × 100us = 60 s of virtual time */
+    static bool patches_applied = false;
     int         i;
+
+    /*
+     * Apply BSP patches at the very first diag sample (~1us virtual time),
+     * BEFORE the BSP has a chance to enter any of the patched functions.
+     * Was previously in mpc5200_tick (60Hz, first fire delayed 1s) — by
+     * which time usrToolsInit had already entered printf and PEND'd on
+     * the unposted PSC1 TX sem.
+     */
+    if (!patches_applied) {
+        mpc5200_apply_keyswitch_patches();
+        patches_applied = true;
+    }
 
     target_ulong nip = s->cpu->env.nip;
     target_ulong msr = s->cpu->env.msr;
@@ -733,12 +795,8 @@ static void mpc5200_tick(void *opaque)
     MPC5200State *s = opaque;
     static int  tick_count = 0;
     static bool ext_armed  = false;
-    static bool patches_applied = false;
-
-    if (!patches_applied) {
-        mpc5200_apply_keyswitch_patches();
-        patches_applied = true;
-    }
+    /* Patches now applied from mpc5200_diag_sample (fires at 1us, much
+     * earlier than this 60Hz tick which is delayed 1s by design). */
 
     if (!ext_armed) {
         uint32_t w = ldl_be_phys(&address_space_memory, 0x508);
@@ -1010,6 +1068,30 @@ static void mpc5200_tick(void *opaque)
                     "  [%2d] tcb=0x%08x %-16s prio=%3u %-8s "
                     "sem=0x%08x errno=0x%08x PC=0x%08x LR=0x%08x SP=0x%08x\n",
                     n, tcb, nm, prio, st, pSemId, errnov, pc, lr, sp);
+
+            /*
+             * For tRootTask in PEND state: walk back-chain from saved SP
+             * to dump the call chain. PowerPC EABI: sp[0] = caller's SP,
+             * caller's SP[1] (i.e. *(caller_sp+4)) = saved LR of this
+             * frame. This reveals which usrRoot bl call we're stuck in.
+             */
+            if (status == 0x2 && nm[0] == 't' && nm[1] == 'R' &&
+                sp >= 0x07000000 && sp < 0x08000000) {
+                uint32_t fp = sp;
+                fprintf(stderr, "       stack chain (back-chain LR walk):\n");
+                for (int f = 0; f < 24 && fp >= 0x07000000 &&
+                                 fp < 0x08000000; f++) {
+                    uint32_t next  = ldl_be_phys(as, fp);
+                    uint32_t lr_at = ldl_be_phys(as, fp + 4);
+                    fprintf(stderr,
+                            "         [%2d] sp=0x%08x lr=0x%08x\n",
+                            f, fp, lr_at);
+                    if (next == 0 || next == fp || next < fp) {
+                        break;
+                    }
+                    fp = next;
+                }
+            }
             cur = ldl_be_phys(as, cur);  /* DLL_NODE.next */
         }
         fflush(stderr);
