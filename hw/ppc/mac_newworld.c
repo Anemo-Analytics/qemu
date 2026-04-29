@@ -255,8 +255,21 @@ static void mpc5200_i2c2_init(MPC5200I2CState *i2c)
  */
 static void mpc5200_update_ext(MPC5200State *s)
 {
-    int lvl = (s->ic_pending || s->ic_fec_pending || s->ic_sdma_pending)
-              ? 1 : 0;
+    /*
+     * 2026-05-05 dispatch experiment: drop SLT1 (s->ic_pending) from
+     * the OR. Hypothesis (per agent 1 review): SLT1 fires every 1s
+     * and holds ic_pending=true between BSP reads of 0x524, keeping
+     * the EXT line at 1 continuously. When SDMA RAISES,
+     * `pending_interrupts` already has EXT bit set, so
+     * `ppc_set_irq(EXT, 1)` is a no-op (edge-tracked at line 60 of
+     * hw/ppc/ppc.c) — `ppc_maybe_interrupt` is never re-invoked,
+     * CPU never re-takes the exception. sysClkInt is on the DEC
+     * vector (per BSP_static_a1_vxworks.md and runtime station
+     * 0x117fd0), not EXT — so removing SLT1 from EXT doesn't break
+     * the clock. The legacy 0x524 SLT1 dispatch path is left in
+     * place as a fallback.
+     */
+    int lvl = (s->ic_fec_pending || s->ic_sdma_pending) ? 1 : 0;
     static int prev = -1;
     static unsigned ext_log = 0;
     /* Log first 32, then every 100th, then any with sdma=1. */
@@ -316,14 +329,22 @@ static void mpc5200_sdma_eval_irq(MPC5200State *s)
     bool was_pending = s->ic_sdma_pending;
     s->ic_sdma_pending = (intp & ~mask) != 0;
     static unsigned log = 0;
-    if (log++ < 64) {
+    bool transitioned = (s->ic_sdma_pending != was_pending);
+    /* Always log transitions; rate-limit no-change to first 64. */
+    if (transitioned || log++ < 64) {
+        uint32_t pi  = (uint32_t)s->cpu->env.pending_interrupts;
+        uint32_t msr = (uint32_t)s->cpu->env.msr;
         fprintf(stderr,
                 "SDMA eval: IntPending=0x%08x IntMask=0x%08x unmasked=0x%08x "
-                "%s\n",
+                "%s  [pi.EXT=%d MSR.EE=%d slt=%d fec=%d sdma=%d nip=0x%08x]\n",
                 intp, mask, intp & ~mask,
-                s->ic_sdma_pending != was_pending
+                transitioned
                     ? (s->ic_sdma_pending ? "RAISE" : "CLEAR")
-                    : "(no change)");
+                    : "(no change)",
+                (pi & PPC_INTERRUPT_EXT) ? 1 : 0,
+                (msr & (1u << 15)) ? 1 : 0,    /* MSR_EE bit (15 PPC) */
+                s->ic_pending, s->ic_fec_pending, s->ic_sdma_pending,
+                (unsigned)s->cpu->env.nip);
         fflush(stderr);
     }
     mpc5200_update_ext(s);
