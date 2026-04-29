@@ -557,6 +557,13 @@ static void mpc5200_apply_keyswitch_patches(void)
      * bootrom semGive, 686 direct callers in vxworks.out, name string at
      * 0x003e67b0 referenced from runtime symtab record at 0x008fe080.
      *
+     * Update 2026-05-07 (gate 9 follow-up): swap tail-call from semGive
+     * @ 0x002ff5c4 to semFlush @ 0x002ff884. semFlush has byte-identical
+     * prologue + class-table dispatch wrapper, but its post-dispatch impl
+     * unconditionally wakes ALL waiters — bypasses any state check that
+     * caused semGive to silently drop the wake. Single-waiter sem (only
+     * tFecEndRx blocks on 0x07bee080) so semantically equivalent here.
+     *
      * intUnlock @ 0x00138a7c — verified: mfmsr; rlwinm clear EE; mtmsr;
      * isync; blr (matches bootrom 0x010fXXXX intUnlock primitive).
      *
@@ -572,7 +579,7 @@ static void mpc5200_apply_keyswitch_patches(void)
      *   +0x1C  beq+  +0x10            ; skip if no sem (->+0x2c)
      *   +0x20  li    r9, 0
      *   +0x24  stw   r9,  0(r10)      ; clear flag BEFORE call
-     *   +0x28  b     0x002ff5c4       ; tail-call semGive (no link)
+     *   +0x28  b     0x002ff884       ; tail-call semFlush (no link)
      *   +0x2C  blr                    ; reached via beq when no sem
      *
      * r3, r9, r10, r12 are PPC ABI volatile (caller-saved). sysClkInt's
@@ -584,7 +591,7 @@ static void mpc5200_apply_keyswitch_patches(void)
     {
         const uint32_t stub_addr     = 0x002acef0;
         const uint32_t intunlock_addr = 0x00138a7c;
-        const uint32_t semgive_addr  = 0x002ff5c4;
+        const uint32_t semgive_addr  = 0x002ff884; /* semFlush — wakes all */
         const uint32_t patch_site    = 0x001180b8;
 
         /* Encode bl/b: insn = 0x48000000 | (offset & 0x03FFFFFC) | LK. */
@@ -606,7 +613,7 @@ static void mpc5200_apply_keyswitch_patches(void)
             0x41820010,    /* +0x1C  beq   +0x10  (-> +0x2c)                */
             0x39200000,    /* +0x20  li    r9, 0                            */
             0x912a0000,    /* +0x24  stw   r9,  0(r10)                      */
-            b_semgive,     /* +0x28  b     0x002ff5c4 (tail-call, no link)  */
+            b_semgive,     /* +0x28  b     0x002ff884 (tail-call semFlush) */
             0x4e800020,    /* +0x2C  blr   (no-sem path)                    */
         };
         /* Convert to BE byte array for cpu_physical_memory_write. */
@@ -658,7 +665,7 @@ static void mpc5200_apply_keyswitch_patches(void)
             "read=0x2b18fc close=0x2b17d4 (doorbell @ 0xF0004000, root=%s); "
             "no-op'd printf at 0x2acee8 (PSC1 TX IRQ workaround); "
             "installed sysClkInt tail-patch @ 0x001180b8 -> stub @ 0x002acef0 "
-            "(semGive shim for tFecEndRx wake; semGive @ 0x002ff5c4)\n",
+            "(semGive shim for tFecEndRx wake; tail-calls semFlush @ 0x002ff884)\n",
             fshook_root());
     fflush(stderr);
 }
@@ -773,13 +780,19 @@ static BootStation g_boot_stations[] = {
      * eval log, the problem is dispatch (Phase 1). */
     { 0x00132854, 0x00132857, "VX: SDMA Main ISR entry (0x132854)",      false, 0 },
 
-    /* === sysClkInt tail-patch shim (plan 2026-05-06) ===
+    /* === sysClkInt tail-patch shim (plan 2026-05-06; updated 2026-05-07) ===
      * Stub @ 0x002acef0 fires once per ~17 ms tick — first hit confirms
-     * patch is wired correctly. semGive @ 0x002ff5c4 fires only when
-     * the RX hook has set sem_queue — first hit there confirms the
-     * shim actually delivered a wake to the BSP scheduler. */
+     * patch is wired correctly. semFlush @ 0x002ff884 fires only when
+     * the RX hook (or synthetic doorbell) has set sem_queue — first hit
+     * there confirms the shim actually delivered a wake.
+     *
+     * Both semGive (0x002ff5c4) and semFlush (0x002ff884) are sampled
+     * here — semGive is unused as the tail-call target after the 2026-05-07
+     * swap, but it still gets called by ordinary BSP code and lights up
+     * during boot, so its station tells us nothing about the shim. */
     { 0x002acef0, 0x002acef3, "VX: sysClkInt tail-patch stub entry",     false, 0 },
-    { 0x002ff5c4, 0x002ff5c7, "VX: semGive entry (via shim)",            false, 0 },
+    { 0x002ff5c4, 0x002ff5c7, "VX: semGive entry (BSP-direct, not shim)", false, 0 },
+    { 0x002ff884, 0x002ff887, "VX: semFlush entry (via shim)",           false, 0 },
 
     /* === usrRoot stall hunt (plan 2026-05-03) === */
     { 0x00107a08, 0x00107a0b, "VX: bl usrKernelCoreInit",                false, 0 },
@@ -807,6 +820,21 @@ static BootStation g_boot_stations[] = {
 #define NIP_HIST_END   0x011f4000UL
 #define NIP_HIST_SIZE  ((NIP_HIST_END - NIP_HIST_BASE) / 4)
 static unsigned g_nip_hist[NIP_HIST_SIZE];
+
+/*
+ * Step-1 (gate-9 follow-up, plan 2026-05-07): parallel histogram covering
+ * vxworks.out semGive (0x002ff5c4) + semFlush (0x002ff884) bodies. Tells
+ * us which path the wake actually ran:
+ *   0x002ff5c4..0x002ff60c — semGive fast-path dispatch wrapper
+ *   0x002ff610..0x002ff6dc — semGive slow-path kernel hooks
+ *   0x002ff700+           — semGive class-byte dispatch indirect call
+ *   0x002ff714+           — semGive post-dispatch
+ *   0x002ff884..          — semFlush body (the new tail-call target)
+ */
+#define SEMGIVE_HIST_BASE 0x002ff5c0UL
+#define SEMGIVE_HIST_END  0x002ffa00UL
+#define SEMGIVE_HIST_SIZE ((SEMGIVE_HIST_END - SEMGIVE_HIST_BASE) / 4)
+static unsigned g_semgive_hist[SEMGIVE_HIST_SIZE];
 
 static void mpc5200_diag_sample(void *opaque)
 {
@@ -850,6 +878,14 @@ static void mpc5200_diag_sample(void *opaque)
         unsigned idx = (nip - NIP_HIST_BASE) / 4;
         if (g_nip_hist[idx] < UINT_MAX) {
             g_nip_hist[idx]++;
+        }
+    }
+
+    /* Step-1 histogram — semGive + semFlush body coverage. */
+    if (nip >= SEMGIVE_HIST_BASE && nip < SEMGIVE_HIST_END) {
+        unsigned idx = (nip - SEMGIVE_HIST_BASE) / 4;
+        if (g_semgive_hist[idx] < UINT_MAX) {
+            g_semgive_hist[idx]++;
         }
     }
 
@@ -958,6 +994,26 @@ static void mpc5200_diag_sample(void *opaque)
                         k, (unsigned)(NIP_HIST_BASE + top_idx[k] * 4),
                         top_cnt[k]);
             }
+        }
+        /* SEM-HIST: every non-zero entry in the semGive+semFlush body
+         * histogram, in ascending-address order (small range — ~272
+         * slots — so listing all hits is more useful than top-K for
+         * tracing which path actually ran). */
+        {
+            unsigned hits = 0;
+            fprintf(stderr,
+                    "SEM-HIST: semGive+semFlush body samples "
+                    "(0x%08x..0x%08x):\n",
+                    (unsigned)SEMGIVE_HIST_BASE,
+                    (unsigned)SEMGIVE_HIST_END);
+            for (j = 0; j < SEMGIVE_HIST_SIZE; j++) {
+                if (g_semgive_hist[j] == 0) continue;
+                fprintf(stderr, "SEM-HIST:   0x%08x : %u\n",
+                        (unsigned)(SEMGIVE_HIST_BASE + j * 4),
+                        g_semgive_hist[j]);
+                hits++;
+            }
+            fprintf(stderr, "SEM-HIST: %u distinct PCs sampled\n", hits);
         }
         fflush(stderr);
     }
@@ -1236,6 +1292,100 @@ static void mpc5200_tick(void *opaque)
         fprintf(stderr, "SYNTH-DOORBELL: t=%ds, s->fshook.sem_queue = 0x%08x "
                 "(0 means BSP shim cleared it)\n",
                 tick_count / 60, s->fshook.sem_queue);
+        fflush(stderr);
+    }
+
+    /*
+     * Step 2 (gate-9 follow-up, plan 2026-05-07): one-shot sem-layout dump
+     * at vt=10s. Compares the structure at three known PEND'd sems —
+     * tFecEndRx (0x07bee080, the failing one), tNetTask (0x00980a48,
+     * presumed-OK BSP-internal), tWdbTask (0x07ba6828, debug agent).
+     * If layouts agree on offsets, our reading is right and the issue
+     * is in semGive's give logic, not sem-layout. Particular check:
+     * byte at +4 — for 0x07bee080 it's 0x07 (top byte of the 0x07bede38
+     * queue-prev pointer); semGive's slow path does `lbz r0, 4(r31)`
+     * to derive the class-table index.
+     */
+    if (tick_count == 60 * 10) {
+        AddressSpace *as = &address_space_memory;
+        static const struct { uint32_t addr; const char *name; } sems[] = {
+            { 0x07bee080, "tFecEndRx (failing)" },
+            { 0x00980a48, "tNetTask (BSP-internal)" },
+            { 0x07ba6828, "tWdbTask (debug agent)" },
+        };
+        for (int i = 0; i < (int)ARRAY_SIZE(sems); i++) {
+            uint32_t w[8];
+            for (int j = 0; j < 8; j++) {
+                w[j] = ldl_be_phys(as, sems[i].addr + j * 4);
+            }
+            uint8_t b0 = (w[1] >> 24) & 0xff;
+            fprintf(stderr,
+                    "SEM-LAYOUT: 0x%08x %s\n"
+                    "SEM-LAYOUT:   [+0x00]=0x%08x [+0x04]=0x%08x [+0x08]=0x%08x [+0x0C]=0x%08x\n"
+                    "SEM-LAYOUT:   [+0x10]=0x%08x [+0x14]=0x%08x [+0x18]=0x%08x [+0x1C]=0x%08x\n"
+                    "SEM-LAYOUT:   class-byte (top of word @ +4) = 0x%02x\n",
+                    sems[i].addr, sems[i].name,
+                    w[0], w[1], w[2], w[3],
+                    w[4], w[5], w[6], w[7],
+                    b0);
+        }
+        fflush(stderr);
+    }
+
+    /*
+     * Step 3 (gate-9 follow-up, plan 2026-05-07): tFecEndRx TCB watch
+     * across the synth-doorbell window. Every tick from vt=8s to vt=14s,
+     * dump TCB at 0x07bede38 — status (TCB+0x3C), pSemId (TCB+0x5C),
+     * errno (TCB+0x84), saved PC (REG_SET at TCB+0x130, PC at +0x8C).
+     * Tells us whether the wake reached the scheduler:
+     *   status PEND throughout       — wake never made it (workQ?)
+     *   status flickers PEND→READY   — wake reached scheduler then re-blocked
+     *   errno changes                — semGive returned an error path
+     */
+    /*
+     * Step 1 dump (gate-9 follow-up, plan 2026-05-07): one-shot SEM-HIST
+     * at vt=15s. Diag-sampler's diag_max equals the QEMU run timeout, so
+     * its end-of-run dump rarely fires; emit the histogram from here so
+     * we always see it. Same content as the diag-end dump (see below).
+     */
+    if (tick_count == 60 * 15) {
+        unsigned hits = 0;
+        fprintf(stderr,
+                "SEM-HIST: semGive+semFlush body samples "
+                "(0x%08x..0x%08x) at vt=15s:\n",
+                (unsigned)SEMGIVE_HIST_BASE, (unsigned)SEMGIVE_HIST_END);
+        for (unsigned j = 0; j < SEMGIVE_HIST_SIZE; j++) {
+            if (g_semgive_hist[j] == 0) continue;
+            fprintf(stderr, "SEM-HIST:   0x%08x : %u\n",
+                    (unsigned)(SEMGIVE_HIST_BASE + j * 4),
+                    g_semgive_hist[j]);
+            hits++;
+        }
+        fprintf(stderr, "SEM-HIST: %u distinct PCs sampled\n", hits);
+        fflush(stderr);
+    }
+
+    if (tick_count >= 60 * 8 && tick_count <= 60 * 14) {
+        AddressSpace *as = &address_space_memory;
+        const uint32_t tcb = 0x07bede38;
+        uint32_t status = ldl_be_phys(as, tcb + 0x3C);
+        uint32_t pSemId = ldl_be_phys(as, tcb + 0x5C);
+        uint32_t errnov = ldl_be_phys(as, tcb + 0x84);
+        uint32_t pc     = ldl_be_phys(as, tcb + 0x130 + 0x8C);
+        uint32_t lr     = ldl_be_phys(as, tcb + 0x130 + 0x84);
+        const char *st = "?";
+        switch (status) {
+        case 0x0:     st = "READY"; break;
+        case 0x2:     st = "PEND"; break;
+        case 0x4:     st = "DELAY"; break;
+        case 0x6:     st = "PEND+TO"; break;
+        case 0x10000: st = "SUSP"; break;
+        }
+        fprintf(stderr,
+                "TCB-WATCH: t=%d.%02ds tFecEndRx tcb=0x%08x status=0x%x %-7s "
+                "sem=0x%08x errno=0x%08x PC=0x%08x LR=0x%08x\n",
+                tick_count / 60, (tick_count % 60) * 100 / 60,
+                tcb, status, st, pSemId, errnov, pc, lr);
         fflush(stderr);
     }
 
