@@ -2133,12 +2133,14 @@ static void mpc5200_tick(void *opaque)
                     n, tcb, nm, prio, st, pSemId, errnov, pc, lr, sp);
 
             /*
-             * For tRootTask in PEND state: walk back-chain from saved SP
-             * to dump the call chain. PowerPC EABI: sp[0] = caller's SP,
-             * caller's SP[1] (i.e. *(caller_sp+4)) = saved LR of this
-             * frame. This reveals which usrRoot bl call we're stuck in.
+             * For tRootTask: walk back-chain from saved SP to dump the
+             * call chain. PowerPC EABI: sp[0] = caller's SP, caller's
+             * SP[1] (i.e. *(caller_sp+4)) = saved LR of this frame.
+             * This reveals which usrRoot bl call we're stuck in. Walk
+             * for any tRootTask blocked state (PEND or DELAY).
              */
-            if (status == 0x2 && nm[0] == 't' && nm[1] == 'R' &&
+            if ((status == 0x2 || status == 0x4) &&
+                nm[0] == 't' && nm[1] == 'R' &&
                 sp >= 0x07000000 && sp < 0x08000000) {
                 uint32_t fp = sp;
                 fprintf(stderr, "       stack chain (back-chain LR walk):\n");
