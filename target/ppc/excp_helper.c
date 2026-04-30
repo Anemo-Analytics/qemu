@@ -1564,6 +1564,18 @@ void powerpc_excp(PowerPCCPU *cpu, int excp)
                   " => %s (%d) error=%02x\n", env->nip, powerpc_excp_name(excp),
                   excp, env->error_code);
     env->excp_stats[excp]++;
+    {
+        static unsigned excp_count;
+        if (excp_count++ < 4096) {
+            int64_t ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+            fprintf(stderr,
+                    "EXCP #%u: %s (%d) nip=0x%08x msr=0x%08x lr=0x%08x errcode=0x%02x vt_ns=%lld\n",
+                    excp_count, powerpc_excp_name(excp), excp,
+                    (uint32_t)env->nip, (uint32_t)env->msr, (uint32_t)env->lr,
+                    env->error_code, (long long)ns);
+            fflush(stderr);
+        }
+    }
 
     switch (env->excp_model) {
     case POWERPC_EXCP_40x:
@@ -2378,6 +2390,17 @@ static void ppc_deliver_interrupt(CPUPPCState *env, int interrupt)
         powerpc_excp(cpu, POWERPC_EXCP_PIT);
         break;
     case PPC_INTERRUPT_DECR: /* Decrementer exception */
+        {
+            static unsigned d_count;
+            if (d_count++ < 4096) {
+                fprintf(stderr,
+                        "DECR-DELIV #%u: nip=0x%08x msr=0x%08x pi=0x%08x clear=%d\n",
+                        d_count, (uint32_t)env->nip, (uint32_t)env->msr,
+                        (uint32_t)env->pending_interrupts,
+                        ppc_decr_clear_on_delivery(env) ? 1 : 0);
+                fflush(stderr);
+            }
+        }
         if (ppc_decr_clear_on_delivery(env)) {
             env->pending_interrupts &= ~PPC_INTERRUPT_DECR;
         }

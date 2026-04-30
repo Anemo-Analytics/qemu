@@ -338,6 +338,32 @@ int hreg_store_msr(CPUPPCState *env, target_ulong value, int alter_hv)
     }
 #endif
     env->msr = value;
+#if !defined(CONFIG_USER_ONLY)
+    {
+        static target_ulong last_msr;
+        static unsigned log_count;
+        if (((last_msr ^ value) & (1ULL << MSR_EE)) && log_count++ < 8192) {
+            /* Skip the dominant scheduler critical section pair to leave
+             * room for less-frequent transitions. 0x00207f6c clears EE,
+             * 0x00207fe8 restores. 0x00138a74 / 0x00138a8c = intLock/Unlock. */
+            uint32_t nip = (uint32_t)env->nip;
+            bool noisy = (nip == 0x00207f6c) || (nip == 0x00207fe8) ||
+                         (nip == 0x00138a74) || (nip == 0x00138a8c);
+            if (!noisy) {
+                fprintf(stderr,
+                    "MSR.EE %d -> %d  nip=0x%08x lr=0x%08x ctr=0x%08x  pi=0x%08x [%u]\n",
+                    (int)((last_msr >> MSR_EE) & 1),
+                    (int)((value    >> MSR_EE) & 1),
+                    (uint32_t)env->nip, (uint32_t)env->lr,
+                    (uint32_t)env->ctr,
+                    (uint32_t)env->pending_interrupts,
+                    log_count);
+                fflush(stderr);
+            }
+        }
+        last_msr = value;
+    }
+#endif
     hreg_compute_hflags(env);
 #if !defined(CONFIG_USER_ONLY)
     ppc_maybe_interrupt(env);

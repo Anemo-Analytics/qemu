@@ -922,13 +922,36 @@ void cpu_ppc_store_decr(CPUPPCState *env, target_ulong value)
 
     now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     decr = _cpu_ppc_load_decr(env, now);
+    {
+        static unsigned dec_writes;
+        if (dec_writes++ < 4096) {
+            fprintf(stderr,
+                    "MTDEC #%u: old=0x%08x new=0x%08x nip=0x%08x lr=0x%08x msr=0x%08x pi=0x%08x vt_ns=%lld\n",
+                    dec_writes, (uint32_t)decr, (uint32_t)value,
+                    (uint32_t)env->nip, (uint32_t)env->lr,
+                    (uint32_t)env->msr, (uint32_t)env->pending_interrupts,
+                    (long long)now);
+            fflush(stderr);
+        }
+    }
     _cpu_ppc_store_decr(cpu, now, decr, value, nr_bits);
 }
 
 static void cpu_ppc_decr_cb(void *opaque)
 {
     PowerPCCPU *cpu = opaque;
-
+    {
+        static unsigned cb_count;
+        if (cb_count++ < 4096) {
+            CPUPPCState *env = &cpu->env;
+            int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+            fprintf(stderr,
+                    "DECR-CB #%u: nip=0x%08x msr=0x%08x pi=0x%08x vt_ns=%lld\n",
+                    cb_count, (uint32_t)env->nip, (uint32_t)env->msr,
+                    (uint32_t)env->pending_interrupts, (long long)now);
+            fflush(stderr);
+        }
+    }
     cpu_ppc_decr_excp(cpu);
 }
 

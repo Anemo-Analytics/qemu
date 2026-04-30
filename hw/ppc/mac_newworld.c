@@ -102,8 +102,8 @@ void mpc5200_fec_send_packet(DeviceState *dev, const uint8_t *buf, size_t len);
 #include <sys/stat.h>
 #include <errno.h>
 
-#define FSHOOK_OFFSET        0x4000   /* MBAR+0x4000..0x401F doorbell */
-#define FSHOOK_REG_SIZE      0x20
+#define FSHOOK_OFFSET        0x4000   /* MBAR+0x4000..0x403F doorbell */
+#define FSHOOK_REG_SIZE      0x40
 
 /* Doorbell layout: cmd@0, arg0@4, arg1@8, arg2@C, result@10, errno@14. */
 #define FSHOOK_REG_CMD       0x00
@@ -121,6 +121,21 @@ void mpc5200_fec_send_packet(DeviceState *dev, const uint8_t *buf, size_t len);
  * clear. Bypasses the MSR.EE=0 EXT-dispatch wall (2026-05-05 finding) by
  * letting the BSP's own ~60 Hz clock ISR do the wake. */
 #define FSHOOK_REG_SEM_QUEUE 0x1C
+/* netJobAdd-call doorbell (plan 2026-05-11 step 3): QEMU sets NETJOB_FUNC
+ * last (acts as doorbell — non-zero = active). The sysClkInt tail-patch
+ * picks it up next tick, loads args from NETJOB_ARG[1..5], and tail-calls
+ * netJobAdd at runtime VA 0x0022c288. After netJobAdd returns, control
+ * flows back to sysClkInt's continuation via the saved LR.
+ * NETJOB_PROBE is host-readable: a probe stub at 0x002acfc0 stores
+ * 0xCAFEBABE here when invoked, so QEMU can confirm netTask actually
+ * deferred-called the function. */
+#define FSHOOK_REG_NETJOB_FUNC      0x20
+#define FSHOOK_REG_NETJOB_ARG1      0x24
+#define FSHOOK_REG_NETJOB_ARG2      0x28
+#define FSHOOK_REG_NETJOB_ARG3      0x2C
+#define FSHOOK_REG_NETJOB_ARG4      0x30
+#define FSHOOK_REG_NETJOB_ARG5      0x34
+#define FSHOOK_REG_NETJOB_PROBE     0x38
 
 /* Command IDs — match the BSP-side stubs in mpc5200_apply_keyswitch_patches. */
 #define FS_OPEN   1
@@ -231,6 +246,9 @@ typedef struct {
         uint32_t result;
         uint32_t err;
         uint32_t sem_queue;          /* host->guest doorbell: sem_id to give */
+        uint32_t netjob_func;        /* host->guest doorbell: netJobAdd func ptr */
+        uint32_t netjob_args[5];     /* args 1..5 for netJobAdd-deferred call */
+        uint32_t netjob_probe;       /* guest writes 0xCAFEBABE on probe-stub fire */
         struct {
             int  host_fd;
             bool in_use;
@@ -620,39 +638,66 @@ static void mpc5200_apply_keyswitch_patches(void)
     {
         const uint32_t stub_addr     = 0x002acef0;
         const uint32_t intunlock_addr = 0x00138a7c;
-        const uint32_t semgive_addr  = 0x002cd8e0; /* qPriBMapPut — readyQ enqueue */
+        const uint32_t qpribmap_addr = 0x002cd8e0; /* qPriBMapPut — readyQ enqueue */
+        const uint32_t netjobadd_addr = 0x0022c288; /* netJobAdd — runtime sig-match (plan 2026-05-11) */
         const uint32_t patch_site    = 0x001180b8;
 
         /* Encode bl/b: insn = 0x48000000 | (offset & 0x03FFFFFC) | LK. */
         uint32_t bl_intunlock =
-            0x48000000u | ((intunlock_addr - (stub_addr + 0x04)) & 0x03FFFFFC) | 1u;
-        uint32_t b_semgive =
-            0x48000000u | ((semgive_addr  - (stub_addr + 0x4C)) & 0x03FFFFFC);
+            0x48000000u | ((intunlock_addr  - (stub_addr + 0x04)) & 0x03FFFFFC) | 1u;
+        uint32_t b_netjobadd =
+            0x48000000u | ((netjobadd_addr  - (stub_addr + 0x3C)) & 0x03FFFFFC);
+        uint32_t b_qpribmap =
+            0x48000000u | ((qpribmap_addr   - (stub_addr + 0x7C)) & 0x03FFFFFC);
         uint32_t bl_to_stub =
-            0x48000000u | ((stub_addr     - patch_site)         & 0x03FFFFFC) | 1u;
+            0x48000000u | ((stub_addr       - patch_site)         & 0x03FFFFFC) | 1u;
 
-        const uint32_t stub_words[21] = {
+        /*
+         * Extended sysClkInt tail-patch shim (33 instructions, 132 bytes).
+         * Two doorbells, each one-shot per tick, in priority order:
+         *   1. NETJOB_FUNC (0xF0004020) — if non-zero, tail-call netJobAdd
+         *      with args from NETJOB_ARG[1..5]. Used to inject deferred work
+         *      onto netTask (plan 2026-05-11 step 3).
+         *   2. SEM_QUEUE   (0xF000401C) — original tFecEndRx wake path; flips
+         *      TCB+0x3C to 0, clears pSemId, tail-calls qPriBMapPut on readyQ.
+         * Both paths preserve sysClkInt's continuation in r12 and use mtlr
+         * before tail-call. Each doorbell is cleared by the shim BEFORE the
+         * tail-call so the shim doesn't re-fire on the same arg.
+         */
+        const uint32_t stub_words[33] = {
             0x7d8802a6,    /* +0x00  mflr  r12                              */
-            bl_intunlock,  /* +0x04  bl    0x00138a7c                       */
+            bl_intunlock,  /* +0x04  bl    0x00138a7c (intUnlock)            */
             0x3d40f000,    /* +0x08  lis   r10, 0xF000                      */
-            0x614a401c,    /* +0x0C  ori   r10, r10, 0x401C                 */
-            0x806a0000,    /* +0x10  lwz   r3,  0(r10)                      */
-            0x7d8803a6,    /* +0x14  mtlr  r12                               */
-            0x2c030000,    /* +0x18  cmpwi r3, 0                            */
-            0x41820034,    /* +0x1C  beq   +0x34  (-> +0x50 blr)            */
-            0x39200000,    /* +0x20  li    r9, 0                            */
-            0x912a0000,    /* +0x24  stw   r9,  0(r10)                      */
-            0x3d2007bf,    /* +0x28  lis   r9, 0x07BF                       */
-            0x3929de38,    /* +0x2C  addi  r9, r9, -0x21C8 (= 0x07BEDE38)    */
+            0x614a4000,    /* +0x0C  ori   r10, r10, 0x4000  (FSHOOK base)  */
+            0x806a0020,    /* +0x10  lwz   r3,  0x20(r10)  (netjob_func)    */
+            0x2c030000,    /* +0x14  cmpwi r3, 0                            */
+            0x41820028,    /* +0x18  beq   +0x28  (-> +0x40 sem-queue path) */
+            0x808a0024,    /* +0x1C  lwz   r4,  0x24(r10)  (arg1)           */
+            0x80aa0028,    /* +0x20  lwz   r5,  0x28(r10)  (arg2)           */
+            0x80ca002c,    /* +0x24  lwz   r6,  0x2c(r10)  (arg3)           */
+            0x80ea0030,    /* +0x28  lwz   r7,  0x30(r10)  (arg4)           */
+            0x810a0034,    /* +0x2C  lwz   r8,  0x34(r10)  (arg5)           */
             0x38000000,    /* +0x30  li    r0, 0                            */
-            0x9009003c,    /* +0x34  stw   r0, 0x3C(r9) [TCB.status = 0]    */
-            0x9009005c,    /* +0x38  stw   r0, 0x5C(r9) [TCB.pSemId = 0]    */
-            0x3c60009a,    /* +0x3C  lis   r3, 0x009A                       */
-            0x3863af58,    /* +0x40  addi  r3, r3, -0x50A8 (= 0x0099AF58)   */
-            0x7d240b78,    /* +0x44  mr    r4, r9 [TCB]                     */
-            0x38a0001d,    /* +0x48  li    r5, 29 [priority]                */
-            b_semgive,     /* +0x4C  b     0x002cd8e0 (tail-call qPriBMapPut) */
-            0x4e800020,    /* +0x50  blr   (no-sem path)                    */
+            0x900a0020,    /* +0x34  stw   r0,  0x20(r10) (clr netjob)      */
+            0x7d8803a6,    /* +0x38  mtlr  r12                               */
+            b_netjobadd,   /* +0x3C  b     netJobAdd (tail-call)             */
+            0x806a001c,    /* +0x40  lwz   r3,  0x1c(r10) (sem_queue)       */
+            0x7d8803a6,    /* +0x44  mtlr  r12                               */
+            0x2c030000,    /* +0x48  cmpwi r3, 0                            */
+            0x41820034,    /* +0x4C  beq   +0x34  (-> +0x80 blr)             */
+            0x39200000,    /* +0x50  li    r9, 0                            */
+            0x912a001c,    /* +0x54  stw   r9,  0x1c(r10) (clr sem_queue)   */
+            0x3d2007bf,    /* +0x58  lis   r9, 0x07BF                       */
+            0x3929de38,    /* +0x5C  addi  r9, r9, -0x21C8 (= 0x07BEDE38)    */
+            0x38000000,    /* +0x60  li    r0, 0                            */
+            0x9009003c,    /* +0x64  stw   r0, 0x3C(r9) (TCB.status = 0)   */
+            0x9009005c,    /* +0x68  stw   r0, 0x5C(r9) (TCB.pSemId = 0)   */
+            0x3c60009a,    /* +0x6C  lis   r3, 0x009A                       */
+            0x3863af58,    /* +0x70  addi  r3, r3, -0x50A8 (= 0x0099AF58)   */
+            0x7d240b78,    /* +0x74  mr    r4, r9 [TCB]                     */
+            0x38a0001d,    /* +0x78  li    r5, 29 [priority]                */
+            b_qpribmap,    /* +0x7C  b     0x002cd8e0 (tail-call qPriBMapPut)*/
+            0x4e800020,    /* +0x80  blr   (no-doorbell path)                */
         };
         /* Convert to BE byte array for cpu_physical_memory_write. */
         uint8_t stub_bytes[sizeof(stub_words)];
@@ -663,6 +708,50 @@ static void mpc5200_apply_keyswitch_patches(void)
             stub_bytes[i*4 + 3] = (stub_words[i] >>  0) & 0xFF;
         }
         cpu_physical_memory_write(stub_addr, stub_bytes, sizeof(stub_bytes));
+
+        /*
+         * NETJOB-PROBE / RX-wake stub at 0x002acf80. Run in netTask context
+         * (via netJobAdd deferred-call). Does:
+         *   1. Write flag=8 at 0x07BEDD04 (= struct+848 for tFecEndRx). This
+         *      makes tFecEndRx's main loop take the work-path on wake instead
+         *      of falling through to cleanup-and-exit.
+         *   2. Write 0xCAFEBABE to NETJOB_PROBE MMIO so QEMU sees the call hit.
+         *   3. Call semGive(0x07bee080) — proper kernel wake of tFecEndRx, in
+         *      netTask (EE=1) context, so semGive can dispatch the scheduler.
+         *   4. Return.
+         * 13 insns / 52 bytes. semGive @ 0x002ff5c4.
+         *
+         * The flag location 0x07BEDD04 = struct_ptr 0x07BED9B4 + 848. struct_ptr
+         * back-computed from sem ID 0x07bee080 stored at struct+1248 (per disasm
+         * of tFecEndRx entry @ 0x12e294).
+         */
+        const uint32_t probe_addr = 0x002acf80;
+        const uint32_t semgive_addr = 0x002ff5c4;
+        uint32_t bl_semgive =
+            0x48000000u | ((semgive_addr - (probe_addr + 0x2C)) & 0x03FFFFFC) | 1u;
+        const uint32_t probe_words[13] = {
+            0x3d2007be,    /* +0x00  lis   r9,  0x07BE                      */
+            0x6129dd04,    /* +0x04  ori   r9,  r9, 0xDD04 (= 0x07BEDD04)   */
+            0x39400008,    /* +0x08  li    r10, 8                            */
+            0x91490000,    /* +0x0C  stw   r10, 0(r9) (flag = 8)             */
+            0x3d20f000,    /* +0x10  lis   r9,  0xF000                      */
+            0x61294038,    /* +0x14  ori   r9,  r9, 0x4038 (NETJOB_PROBE)   */
+            0x3d40cafe,    /* +0x18  lis   r10, 0xCAFE                      */
+            0x614ababe,    /* +0x1C  ori   r10, r10, 0xBABE                 */
+            0x91490000,    /* +0x20  stw   r10, 0(r9) (probe = 0xCAFEBABE)  */
+            0x3c6007be,    /* +0x24  lis   r3,  0x07BE                      */
+            0x6063e080,    /* +0x28  ori   r3,  r3, 0xE080 (sem ID)         */
+            bl_semgive,    /* +0x2C  bl    0x002ff5c4 (semGive)              */
+            0x4e800020,    /* +0x30  blr                                    */
+        };
+        uint8_t probe_bytes[sizeof(probe_words)];
+        for (unsigned i = 0; i < ARRAY_SIZE(probe_words); i++) {
+            probe_bytes[i*4 + 0] = (probe_words[i] >> 24) & 0xFF;
+            probe_bytes[i*4 + 1] = (probe_words[i] >> 16) & 0xFF;
+            probe_bytes[i*4 + 2] = (probe_words[i] >>  8) & 0xFF;
+            probe_bytes[i*4 + 3] = (probe_words[i] >>  0) & 0xFF;
+        }
+        cpu_physical_memory_write(probe_addr, probe_bytes, sizeof(probe_bytes));
 
         /* Patch sysClkInt: replace `bl 0x00138a7c` at 0x001180b8 with
          * `bl <stub_addr>`. The original orig-bl encoding is 0x480209c5;
@@ -680,19 +769,27 @@ static void mpc5200_apply_keyswitch_patches(void)
      * the writes landed (catches DRAM-mapping / read-only-region issues
      * that would otherwise be silent). */
     {
-        uint8_t v_site[4], v_stub[12];
+        uint8_t v_site[4], v_stub[16], v_probe[16];
         cpu_physical_memory_read(0x001180b8, v_site, sizeof(v_site));
         cpu_physical_memory_read(0x002acef0, v_stub, sizeof(v_stub));
+        cpu_physical_memory_read(0x002acf80, v_probe, sizeof(v_probe));
         fprintf(stderr,
                 "MPC5200: post-patch verify: 0x001180b8 = %02x%02x%02x%02x "
                 "(expect bl 0x002acef0 = 48194e39); "
-                "0x002acef0 = %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x "
+                "0x002acef0 = %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x "
                 "(expect mflr r12 = 7d8802a6, bl intUnlock = 4be8bb89, "
-                "lis r10,0xF000 = 3d40f000)\n",
+                "lis r10,0xF000 = 3d40f000, ori = 614a4000); "
+                "probe @ 0x002acf80 = %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x "
+                "(expect lis r9,0xCAFE = 3d20cafe, ori = 6129babe, lis r10,0xF000, ori = 614a4038)\n",
                 v_site[0], v_site[1], v_site[2], v_site[3],
                 v_stub[0], v_stub[1], v_stub[2], v_stub[3],
                 v_stub[4], v_stub[5], v_stub[6], v_stub[7],
-                v_stub[8], v_stub[9], v_stub[10], v_stub[11]);
+                v_stub[8], v_stub[9], v_stub[10], v_stub[11],
+                v_stub[12], v_stub[13], v_stub[14], v_stub[15],
+                v_probe[0], v_probe[1], v_probe[2], v_probe[3],
+                v_probe[4], v_probe[5], v_probe[6], v_probe[7],
+                v_probe[8], v_probe[9], v_probe[10], v_probe[11],
+                v_probe[12], v_probe[13], v_probe[14], v_probe[15]);
     }
 
     fprintf(stderr,
@@ -703,7 +800,9 @@ static void mpc5200_apply_keyswitch_patches(void)
             "(doorbell @ 0xF0004000, root=%s); "
             "no-op'd printf at 0x2acee8 (PSC1 TX IRQ workaround); "
             "installed sysClkInt tail-patch @ 0x001180b8 -> stub @ 0x002acef0 "
-            "(semGive shim for tFecEndRx wake; tail-calls qPriBMapPut @ 0x002cd8e0 with explicit args)\n",
+            "(33-insn extended shim: netjob path -> netJobAdd @ 0x0022c288 + "
+            "sem-queue path -> qPriBMapPut @ 0x002cd8e0); "
+            "probe stub @ 0x002acf80 (writes 0xCAFEBABE to MMIO 0xF0004038)\n",
             fshook_root());
     fflush(stderr);
 }
@@ -829,6 +928,9 @@ static BootStation g_boot_stations[] = {
      * swap, but it still gets called by ordinary BSP code and lights up
      * during boot, so its station tells us nothing about the shim. */
     { 0x002acef0, 0x002acef3, "VX: sysClkInt tail-patch stub entry",     false, 0 },
+    { 0x002acf80, 0x002acf83, "VX: NETJOB-PROBE stub entry (deferred)",   false, 0 },
+    { 0x0022c288, 0x0022c28b, "VX: netJobAdd entry (sig-matched)",        false, 0 },
+    { 0x0022c0fc, 0x0022c0ff, "VX: netTask entry (sig-matched)",          false, 0 },
     { 0x002ff5c4, 0x002ff5c7, "VX: semGive entry (BSP-direct, not shim)", false, 0 },
     { 0x002ff884, 0x002ff887, "VX: semFlush entry (via shim)",           false, 0 },
 
@@ -1319,12 +1421,93 @@ static void mpc5200_tick(void *opaque)
      * persistent non-zero value across multiple ticks means the shim
      * is NOT running.
      */
+    /*
+     * SYNTH-DOORBELL (kept). The shim's qPriBMapPut path force-readies
+     * tFecEndRx. Combined with netjob arming below, both paths run on
+     * sequential sysClkInt ticks (netjob first, sem-queue second).
+     */
     if (tick_count == 60 * 8) {
         fprintf(stderr,
                 "SYNTH-DOORBELL: writing s->fshook.sem_queue = 0x07bee080 at "
-                "t=8s (pre-tFecEndRecover-kill) — expect tFecEndRx wake by t=9s\n");
+                "t=8s — expect tFecEndRx wake by t=9s\n");
         fflush(stderr);
         s->fshook.sem_queue = 0x07bee080;
+    }
+
+    /*
+     * ENTRY-PROBE (plan 2026-05-11): one-shot dump at vt=2s of TCB+0x80..+0xC0
+     * for tFecEndRx (0x07BEDE38). Goal: identify the entry-PC offset (standard
+     * VxWorks puts the task entry function pointer somewhere near here).
+     * Cross-check against a code-address range (0x001xxxxx) to find the field
+     * — the right offset will look like a function in vxworks.out's .text.
+     */
+    /*
+     * ENTRY-PROBE: confirmed once, kept for documentation. tFecEndRx entry
+     * function = TCB+0x74 = 0x0012e268. First blocking call: semTake at
+     * 0x002ff730 with sem from r3+1248 (= 0x07bee080). After wake, task
+     * checks flag at r3+848 == 8, else falls through to cleanup/exit.
+     * Struct ptr (= taskInit r3 arg) computed: 0x07bee080 - 1248 = 0x07BEDBA0.
+     */
+    /* ENTRY-PROBE: doc-only summary at vt=2s.
+     * tFecEndRx entry=0x0012e268 (TCB+0x74). First block: semTake @ 0x002ff730
+     * via r3+1248. Struct ptr = 0x07BED9B4 (back-comp from sem 0x07bee080
+     * stored at struct+1248). Flag at struct+848=0x07BEDD04 must be 8 for
+     * tFecEndRx to enter work-path on wake. */
+    if (tick_count == 60 * 2) {
+        AddressSpace *as = &address_space_memory;
+        const uint32_t TCB = 0x07bede38;
+        uint32_t entry = ldl_be_phys(as, TCB + 0x74);
+        fprintf(stderr, "ENTRY-PROBE: tFecEndRx entry=0x%08x (TCB+0x74), "
+                "struct_ptr=0x07bed9b4, sem=0x07bee080, flag@0x07bedd04\n", entry);
+        fflush(stderr);
+    }
+
+    /*
+     * NETJOB-DOORBELL test (plan 2026-05-11 step 3): at vt=12s, arm the
+     * netjob doorbell with the probe stub. The next sysClkInt picks it up,
+     * tail-calls netJobAdd(probe, 0,0,0,0,0). netJobAdd enqueues + semGives
+     * netTaskSem. netTask wakes, dequeues, calls probe(0,0,0,0,0). Probe
+     * writes 0xCAFEBABE to NETJOB_PROBE MMIO. QEMU logs "NETJOB-PROBE: flag
+     * flipped" — confirms the full netJobAdd→netTask deferred path works.
+     *
+     * Pre-conditions: tNetTask must be PEND on netTaskSem (= netJobInfo+12).
+     * If tNetTask isn't running yet (ENT init not done) the semGive queues
+     * but no consumer drains; we'd see no probe flip.
+     */
+    /*
+     * Arm at multiple times. sysClkInt may stop firing past vt~11.5s when
+     * tFecEndRx becomes READY-but-stuck (kernel scheduler degenerates).
+     * Arm at vt=4s (pre-sem-wake), vt=6s, vt=10s — one of these should hit
+     * a live sysClkInt firing before the scheduler stalls.
+     */
+    /*
+     * Arm netjob doorbell at multiple times. By vt=8s tFecEndRx is PEND on
+     * sem 0x07bee080. Our wake-stub semGives that sem in netTask context
+     * (proper kernel path), waking tFecEndRx with correct register state.
+     * Re-arm at later times in case sysClkInt isn't picking up earlier arms.
+     */
+    if ((tick_count == 60 * 8 || tick_count == 60 * 9 ||
+         tick_count == 60 * 10) && s->fshook.netjob_func == 0) {
+        s->fshook.netjob_args[0] = 0;
+        s->fshook.netjob_args[1] = 0;
+        s->fshook.netjob_args[2] = 0;
+        s->fshook.netjob_args[3] = 0;
+        s->fshook.netjob_args[4] = 0;
+        s->fshook.netjob_func    = 0x002acf80;  /* probe stub (wake tFecEndRx) */
+        fprintf(stderr,
+                "NETJOB-DOORBELL: armed at vt=%ds, func=0x002acf80 "
+                "(wake-stub); expecting NETJOB-PROBE within ~2s\n",
+                tick_count / 60);
+        fflush(stderr);
+    }
+    if (tick_count >= 60 * 4 && tick_count <= 60 * 20 &&
+        (tick_count % 30) == 0) {
+        fprintf(stderr,
+                "NETJOB-WATCH: t=%d.%02ds netjob_func=0x%08x "
+                "netjob_probe=0x%08x\n",
+                tick_count / 60, (tick_count % 60) * 100 / 60,
+                s->fshook.netjob_func, s->fshook.netjob_probe);
+        fflush(stderr);
     }
     if (tick_count >= 60 * 8 && tick_count <= 60 * 14 && (tick_count % 60) == 0) {
         fprintf(stderr, "SYNTH-DOORBELL: t=%ds, s->fshook.sem_queue = 0x%08x "
@@ -2043,6 +2226,27 @@ static uint64_t mpc5200_mmio_read(void *opaque, hwaddr offset, unsigned size)
         case FSHOOK_REG_ARG1:      return s->fshook.arg1;
         case FSHOOK_REG_ARG2:      return s->fshook.arg2;
         case FSHOOK_REG_SEM_QUEUE: return s->fshook.sem_queue;
+        case FSHOOK_REG_NETJOB_FUNC: {
+            static unsigned shim_reads;
+            static unsigned last_bucket = 0xFFFFFFFFu;
+            shim_reads++;
+            unsigned bucket = shim_reads / 60;
+            if (bucket != last_bucket) {
+                int64_t ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+                fprintf(stderr,
+                        "SHIM-FIRE: bucket=%u (%u reads) vt_ns=%lld\n",
+                        bucket, shim_reads, (long long)ns);
+                fflush(stderr);
+                last_bucket = bucket;
+            }
+            return s->fshook.netjob_func;
+        }
+        case FSHOOK_REG_NETJOB_ARG1: return s->fshook.netjob_args[0];
+        case FSHOOK_REG_NETJOB_ARG2: return s->fshook.netjob_args[1];
+        case FSHOOK_REG_NETJOB_ARG3: return s->fshook.netjob_args[2];
+        case FSHOOK_REG_NETJOB_ARG4: return s->fshook.netjob_args[3];
+        case FSHOOK_REG_NETJOB_ARG5: return s->fshook.netjob_args[4];
+        case FSHOOK_REG_NETJOB_PROBE: return s->fshook.netjob_probe;
         default:                   return 0;
         }
     }
@@ -2507,6 +2711,28 @@ static void mpc5200_bestcomm_rx_hook(const uint8_t *buf, size_t len)
     s->fshook.sem_queue = 0x07bee080;
 
     /*
+     * netJobAdd doorbell (plan 2026-05-11 step 4): wire RX-walker to also
+     * enqueue a netJobAdd call. The deferred function (probe_addr 0x002acf80)
+     * runs in netTask context (EE=1) and does:
+     *   1. *(struct+848) = 8 (set the work-flag tFecEndRx checks on wake)
+     *   2. write 0xCAFEBABE to NETJOB_PROBE MMIO (visibility)
+     *   3. semGive(0x07bee080) (proper kernel wake of tFecEndRx)
+     * This routes the wake through netTask's full kernel-context semGive,
+     * so when tFecEndRx resumes from semTake, it sees flag=8 and runs its
+     * main RX-processing path — picks up our just-delivered BD and TXes a
+     * reply.
+     *
+     * Set unconditionally on every RX. If a prior arm hasn't been picked up
+     * yet, the new value overrides (fine — same stub address).
+     */
+    s->fshook.netjob_func    = 0x002acf80;
+    s->fshook.netjob_args[0] = 0;
+    s->fshook.netjob_args[1] = 0;
+    s->fshook.netjob_args[2] = 0;
+    s->fshook.netjob_args[3] = 0;
+    s->fshook.netjob_args[4] = 0;
+
+    /*
      * READYQ-FORCE-RX (plan 2026-05-11 step 3): the wake-once at vt=10s
      * dispatched tFecEndRx ONCE (PC moved 0x002fe918 → 0x00175628 at
      * the post-windExit return point). After that, readyQ.first stays 0
@@ -2591,6 +2817,24 @@ static void mpc5200_mmio_write(void *opaque, hwaddr offset,
                 fflush(stderr);
             }
             s->fshook.sem_queue = v;
+            return;
+        }
+        case FSHOOK_REG_NETJOB_FUNC: s->fshook.netjob_func    = v;  return;
+        case FSHOOK_REG_NETJOB_ARG1: s->fshook.netjob_args[0] = v;  return;
+        case FSHOOK_REG_NETJOB_ARG2: s->fshook.netjob_args[1] = v;  return;
+        case FSHOOK_REG_NETJOB_ARG3: s->fshook.netjob_args[2] = v;  return;
+        case FSHOOK_REG_NETJOB_ARG4: s->fshook.netjob_args[3] = v;  return;
+        case FSHOOK_REG_NETJOB_ARG5: s->fshook.netjob_args[4] = v;  return;
+        case FSHOOK_REG_NETJOB_PROBE: {
+            /* Guest probe stub at 0x002acfc0 writes 0xCAFEBABE here when
+             * netTask deferred-invokes it via netJobAdd. Confirms the call
+             * actually reached the function. */
+            s->fshook.netjob_probe = v;
+            fprintf(stderr, "NETJOB-PROBE: flag flipped, value=0x%08x "
+                    "(NIP=0x%08x LR=0x%08x)\n",
+                    v, (unsigned)s->cpu->env.nip,
+                    (unsigned)s->cpu->env.lr);
+            fflush(stderr);
             return;
         }
         default:                return;
