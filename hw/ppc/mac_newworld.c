@@ -818,51 +818,48 @@ static void mpc5200_apply_keyswitch_patches(void)
                                   sizeof(nop_bytes));
 
         /*
-         * NETJOB-PROBE / RX-wake stub at 0x002acf80 (UNCHANGED). Run in
+         * NETJOB-PROBE / RX-wake stub at 0x002acf80 (LR-safe). Run in
          * netTask context (via netJobAdd deferred-call). Does:
-         *   1. Write flag=8 at 0x07BEDD04 (= struct+848 for tFecEndRx). This
+         *   1. Save caller LR in r12 (volatile per PPC ABI; same idiom as
+         *      sysClkInt shim).
+         *   2. Write flag=8 at 0x07BEDD04 (= struct+848 for tFecEndRx). This
          *      makes tFecEndRx's main loop take the work-path on wake instead
          *      of falling through to cleanup-and-exit.
-         *   2. Write 0xCAFEBABE to NETJOB_PROBE MMIO so QEMU sees the call hit.
          *   3. Call semGive(0x07bee080) — proper kernel wake of tFecEndRx, in
          *      netTask (EE=1) context, so semGive can dispatch the scheduler.
-         *   4. Return.
-         * 13 insns / 52 bytes. semGive @ 0x002ff5c4.
+         *   4. Restore caller LR from r12, then blr.
+         * 10 insns / 40 bytes. semGive @ 0x002ff5c4. Stub ends at 0x002acfa8,
+         * 8 bytes clear of the live function at 0x002acfb0.
          *
-         * Note: probe stub has a latent LR-loop bug (no mflr/mtlr around `bl
-         * semGive`) — when semGive returns, blr at probe_addr+0x30 returns
-         * to itself = infinite self-loop. Currently masked because DECR
-         * preempts every ~13ms. NOT fixed here (relocating to 0x002acfd0
-         * collides with the live function at 0x002acfb0).
+         * The previous stub had an LR-loop bug: `bl semGive` set LR to
+         * probe+0x30, semGive's epilogue restored that, then the trailing
+         * blr branched right back to itself — pinning tNetTask in a loop
+         * that only DECR preempt could escape, so the netjob doorbell got
+         * armed exactly once instead of once per RX. mflr/mtlr fixes that.
+         *
+         * Dropped: the 0xCAFEBABE write to MMIO 0xF0004038 (one-shot debug
+         * visibility — we have READYQ-FORCE-RX, BestComm RX, station hits
+         * as alternate signals).
          *
          * The flag location 0x07BEDD04 = struct_ptr 0x07BED9B4 + 848.
          * struct_ptr back-computed from sem ID 0x07bee080 stored at
          * struct+1248 (per disasm of tFecEndRx entry @ 0x12e294).
-         *
-         * Side-effect: probe stub's trailing blr at offset 0x30 lands at
-         * 0x002acfb0 — overwriting the FIRST instruction of the live
-         * function at 0x002acfb0. Calls to that function early-return
-         * harmlessly (no frame allocated). This is a known/lucky aliasing
-         * we depend on.
          */
         const uint32_t probe_addr = 0x002acf80;
         const uint32_t semgive_addr = 0x002ff5c4;
         uint32_t bl_semgive =
-            0x48000000u | ((semgive_addr - (probe_addr + 0x2C)) & 0x03FFFFFC) | 1u;
-        const uint32_t probe_words[13] = {
-            0x3d2007be,    /* +0x00  lis   r9,  0x07BE                      */
-            0x6129dd04,    /* +0x04  ori   r9,  r9, 0xDD04 (= 0x07BEDD04)   */
-            0x39400008,    /* +0x08  li    r10, 8                            */
-            0x91490000,    /* +0x0C  stw   r10, 0(r9) (flag = 8)             */
-            0x3d20f000,    /* +0x10  lis   r9,  0xF000                      */
-            0x61294038,    /* +0x14  ori   r9,  r9, 0x4038 (NETJOB_PROBE)   */
-            0x3d40cafe,    /* +0x18  lis   r10, 0xCAFE                      */
-            0x614ababe,    /* +0x1C  ori   r10, r10, 0xBABE                 */
-            0x91490000,    /* +0x20  stw   r10, 0(r9) (probe = 0xCAFEBABE)  */
-            0x3c6007be,    /* +0x24  lis   r3,  0x07BE                      */
-            0x6063e080,    /* +0x28  ori   r3,  r3, 0xE080 (sem ID)         */
-            bl_semgive,    /* +0x2C  bl    0x002ff5c4 (semGive)              */
-            0x4e800020,    /* +0x30  blr  (lands at 0x002acfb0)              */
+            0x48000000u | ((semgive_addr - (probe_addr + 0x1C)) & 0x03FFFFFC) | 1u;
+        const uint32_t probe_words[10] = {
+            0x7d8802a6,    /* +0x00  mflr  r12 (save caller's LR)           */
+            0x3d2007be,    /* +0x04  lis   r9,  0x07BE                      */
+            0x6129dd04,    /* +0x08  ori   r9,  r9, 0xDD04 (= 0x07BEDD04)   */
+            0x39400008,    /* +0x0C  li    r10, 8                            */
+            0x91490000,    /* +0x10  stw   r10, 0(r9) (flag = 8)             */
+            0x3c6007be,    /* +0x14  lis   r3,  0x07BE                      */
+            0x6063e080,    /* +0x18  ori   r3,  r3, 0xE080 (sem ID)         */
+            bl_semgive,    /* +0x1C  bl    0x002ff5c4 (semGive)              */
+            0x7d8803a6,    /* +0x20  mtlr  r12 (restore caller's LR)        */
+            0x4e800020,    /* +0x24  blr                                     */
         };
         uint8_t probe_bytes[sizeof(probe_words)];
         for (unsigned i = 0; i < ARRAY_SIZE(probe_words); i++) {
@@ -889,7 +886,7 @@ static void mpc5200_apply_keyswitch_patches(void)
      * the writes landed (catches DRAM-mapping / read-only-region issues
      * that would otherwise be silent). */
     {
-        uint8_t v_site[4], v_stub[16], v_probe[16];
+        uint8_t v_site[4], v_stub[16], v_probe[40];
         uint8_t v_guard_dc[4], v_guard_a8[4];
         cpu_physical_memory_read(0x001180b8, v_site, sizeof(v_site));
         cpu_physical_memory_read(0x002acef0, v_stub, sizeof(v_stub));
@@ -902,9 +899,14 @@ static void mpc5200_apply_keyswitch_patches(void)
                 "0x002acef0 = %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x "
                 "(expect mflr r12 = 7d8802a6, bl intUnlock = 4be8bb89, "
                 "lis r10,0xF000 = 3d40f000, ori = 614a4000); "
-                "probe @ 0x002acf80 = %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x "
-                "(expect lis r9,0x07BE = 3d2007be, ori = 6129dd04, "
-                "li r10,8 = 39400008, stw r10,0(r9) = 91490000); "
+                "probe @ 0x002acf80 = "
+                "%02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x "
+                "%02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x "
+                "%02x%02x%02x%02x %02x%02x%02x%02x "
+                "(expect mflr r12 = 7d8802a6, lis r9,0x07BE = 3d2007be, "
+                "ori = 6129dd04, li r10,8 = 39400008, stw r10,0(r9) = 91490000, "
+                "lis r3,0x07BE = 3c6007be, ori = 6063e080, bl semGive, "
+                "mtlr r12 = 7d8803a6, blr = 4e800020); "
                 "0x001791a8 = %02x%02x%02x%02x (expect nop = 60000000, "
                 "was bctrl = 4e800421); "
                 "0x001791dc = %02x%02x%02x%02x (expect nop = 60000000, "
@@ -918,6 +920,12 @@ static void mpc5200_apply_keyswitch_patches(void)
                 v_probe[4], v_probe[5], v_probe[6], v_probe[7],
                 v_probe[8], v_probe[9], v_probe[10], v_probe[11],
                 v_probe[12], v_probe[13], v_probe[14], v_probe[15],
+                v_probe[16], v_probe[17], v_probe[18], v_probe[19],
+                v_probe[20], v_probe[21], v_probe[22], v_probe[23],
+                v_probe[24], v_probe[25], v_probe[26], v_probe[27],
+                v_probe[28], v_probe[29], v_probe[30], v_probe[31],
+                v_probe[32], v_probe[33], v_probe[34], v_probe[35],
+                v_probe[36], v_probe[37], v_probe[38], v_probe[39],
                 v_guard_a8[0], v_guard_a8[1], v_guard_a8[2], v_guard_a8[3],
                 v_guard_dc[0], v_guard_dc[1], v_guard_dc[2], v_guard_dc[3]);
     }
@@ -937,7 +945,8 @@ static void mpc5200_apply_keyswitch_patches(void)
             "nopped excExcHandle bctrl @ 0x001791a8 + 0x001791dc (skips all "
             "hook-handler calls at both indirect-call sites to avoid "
             "NULL-fn-ptr crashes); "
-            "probe stub @ 0x002acf80 (writes 0xCAFEBABE to MMIO 0xF0004038)\n",
+            "probe stub @ 0x002acf80 (wakes tFecEndRx via mflr/bl semGive/"
+            "mtlr/blr -- LR-safe)\n",
             fshook_root());
     fflush(stderr);
 }
@@ -2008,6 +2017,7 @@ static void mpc5200_tick(void *opaque)
         static const struct { uint32_t tcb; const char *name; } watchlist[] = {
             { 0x07bede38, "tFecEndRx" },
             { 0x07fefe00, "tRootTask" },  /* Phase A coords */
+            { 0x07fc1f30, "tNetTask"  },  /* probe-stub LR-loop watcher */
         };
         for (int w = 0; w < (int)ARRAY_SIZE(watchlist); w++) {
             const uint32_t tcb = watchlist[w].tcb;
@@ -2993,12 +3003,8 @@ static void mpc5200_bestcomm_rx_hook(const uint8_t *buf, size_t len)
      * Set unconditionally on every RX. If a prior arm hasn't been picked up
      * yet, the new value overrides (fine — same stub address).
      */
+    /* probe takes no args; the netjob_args slots are left untouched. */
     s->fshook.netjob_func    = 0x002acf80;
-    s->fshook.netjob_args[0] = 0;
-    s->fshook.netjob_args[1] = 0;
-    s->fshook.netjob_args[2] = 0;
-    s->fshook.netjob_args[3] = 0;
-    s->fshook.netjob_args[4] = 0;
 
     /*
      * READYQ-FORCE-RX (plan 2026-05-11 step 3): the wake-once at vt=10s
