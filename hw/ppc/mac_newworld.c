@@ -1019,6 +1019,23 @@ static BootStation g_boot_stations[] = {
     { 0x0020b848, 0x0020b9fb, "VX: SDMA common installer",              false, 0 },
     { 0x0020a3b0, 0x0020a5f7, "VX: init_dma_image_TASK_FEC_TX",         false, 0 },
 
+    /* === tFecEndRx body progression (plan 2026-05-13 Phase C) ===
+     * Body verified by disasm @ 0x0012e294. Flow:
+     *   0x12e294: lwz r3, 0x4e0(r31) ; load sem-id from struct+0x4e0
+     *   0x12e29c: bl semTake (sig)
+     *   0x12e2a0: cmpwi r3, 0
+     *   0x12e2a4: bne -> 0x12e2b4 (semTake error -> early-exit)
+     *   0x12e2a8: lwz r9, 0x350(r31) ; load work-flag from struct+848
+     *   0x12e2ac: cmpwi cr7, r9, 8
+     *   0x12e2b0: beq cr7, -> 0x12e2c8 (flag == 8 -> work-path)
+     *   0x12e2b4: ; early-exit: lwz r3, 0x4e4 + bl + br to 0x1a4ee4
+     *   0x12e2c8: ; work-continue: stwu, etc.
+     */
+    { 0x0012e294, 0x0012e297, "VX: tFecEndRx entry (pre-semTake)",     false, 0 },
+    { 0x0012e2a8, 0x0012e2ab, "VX: tFecEndRx struct+848 check",        false, 0 },
+    { 0x0012e2b4, 0x0012e2b7, "VX: tFecEndRx early-exit (flag != 8)",  false, 0 },
+    { 0x0012e2c8, 0x0012e2cb, "VX: tFecEndRx work-continue path",      false, 0 },
+
     /* === Vestas-app spawn gate (plan 2026-04-30) === */
     { 0x00100920, 0x00100923, "VX: gate-fn entry (0x100920)",            false, 0 },
     { 0x001009d8, 0x001009db, "VX: gate-check load *(0x962e2c)",         false, 0 },
