@@ -6,7 +6,7 @@
 set -u
 cd "$(dirname "$0")"
 
-ninja -C build qemu-system-ppc
+ ninja -C build qemu-system-ppc
 
 LOG="${LOG:-/tmp/qemu_post_gate.log}"
 PCAP="${PCAP:-/tmp/qemu_post_gate.bin}"
@@ -17,9 +17,12 @@ timeout "${TIMEOUT}" ./build/qemu-system-ppc \
     -device loader,file=/tmp/vxworks_romfs/vxworks.out,cpu-num=0 \
     -nic user,id=n0,model=mpc5200-fec,mac=00:1b:f0:00:00:0a,\
 net=169.254.254.0/24,host=169.254.254.252,\
-hostfwd=tcp::2121-:21,hostfwd=tcp::2049-:2049,\
-hostfwd=tcp::3111-:111,hostfwd=tcp::17185-:17185,\
-hostfwd=tcp::9482-:9482,hostfwd=tcp::8080-:8080 \
+hostfwd=tcp::2121-169.254.254.254:21,\
+hostfwd=tcp::2049-169.254.254.254:2049,\
+hostfwd=tcp::3111-169.254.254.254:111,\
+hostfwd=tcp::17185-169.254.254.254:17185,\
+hostfwd=tcp::9482-169.254.254.254:9482,\
+hostfwd=tcp::8080-169.254.254.254:8080 \
     -object filter-dump,id=f0,netdev=n0,file="${PCAP}" \
     -display none -serial null \
     2>"${LOG}"
