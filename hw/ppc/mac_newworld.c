@@ -710,8 +710,60 @@ static void mpc5200_apply_keyswitch_patches(void)
         cpu_physical_memory_write(stub_addr, stub_bytes, sizeof(stub_bytes));
 
         /*
-         * NETJOB-PROBE / RX-wake stub at 0x002acf80. Run in netTask context
-         * (via netJobAdd deferred-call). Does:
+         * NULL-fn-ptr guard for excExcHandle (plan 2026-05-13, simplified).
+         *
+         * The BSP's exception-hook dispatcher at runtime ~0x00179000 calls
+         * registered handlers via `mtctr r10; bctrl` at 0x001791d8/dc. The
+         * guard at 0x001791d0 only checks struct[+22] (16-bit "installed"
+         * flag), not struct[+24] (the fn-ptr in r10). At vt~13s an entry
+         * has +22 set as enabled (so bf falls through) and +24 = NULL →
+         * bctrl jumps to NIP=0 → Program excp → kernel doesn't recover,
+         * sysClkInt stops.
+         *
+         * Original plan tried installing a 6-insn null-guard stub at
+         * 0x002acfb4 reached via `b 0x002acfb4` patched into 0x001791d4.
+         * The plan assumed 0x002acfb4+ was dead printf-body. WRONG: the
+         * function at 0x002acee8 ends at 0x002acfac with blr, and a
+         * SEPARATE function (vfprintf-style varargs handler) starts at
+         * 0x002acfb0 and extends to 0x002ad074. Corrupting that function's
+         * body with our stub crashed the kernel within the first sysClkInt
+         * tick because callers of 0x002acfb0 fell into our `mtctr r10;
+         * bctrl` and jumped to whatever r10 happened to contain.
+         *
+         * Simpler fix per the plan's "Or simpler" alternative: replace the
+         * bctrl at 0x001791dc with a nop. ALL handler calls at this site
+         * are skipped — even valid ones. Tradeoff per session log: this
+         * site is one of two indirect-call sites in the dispatcher; the
+         * other (at 0x001791a8 with r11) still works. We lose any debug/
+         * log hook handlers registered through this slot, but the kernel
+         * itself is robust to missing hook calls.
+         */
+        const uint32_t guard_call_site = 0x001791dc;
+
+        /* Pre-flight: confirm bctrl bytes at 0x001791dc match. */
+        {
+            uint8_t pre_call[4];
+            cpu_physical_memory_read(guard_call_site, pre_call, sizeof(pre_call));
+            static const uint8_t exp_call[4] = { 0x4e, 0x80, 0x04, 0x21 };
+            if (memcmp(pre_call, exp_call, sizeof(exp_call)) != 0) {
+                fprintf(stderr,
+                        "MPC5200: PRE-PATCH BYTES MISMATCH at 0x001791dc: "
+                        "%02x%02x%02x%02x (expect bctrl 4e800421). "
+                        "BSP image may have changed — refusing to patch.\n",
+                        pre_call[0], pre_call[1], pre_call[2], pre_call[3]);
+                fflush(stderr);
+                abort();
+            }
+        }
+
+        /* Patch bctrl -> nop (0x60000000) at 0x001791dc. */
+        static const uint8_t nop_bytes[4] = { 0x60, 0x00, 0x00, 0x00 };
+        cpu_physical_memory_write(guard_call_site, nop_bytes,
+                                  sizeof(nop_bytes));
+
+        /*
+         * NETJOB-PROBE / RX-wake stub at 0x002acf80 (UNCHANGED). Run in
+         * netTask context (via netJobAdd deferred-call). Does:
          *   1. Write flag=8 at 0x07BEDD04 (= struct+848 for tFecEndRx). This
          *      makes tFecEndRx's main loop take the work-path on wake instead
          *      of falling through to cleanup-and-exit.
@@ -721,9 +773,21 @@ static void mpc5200_apply_keyswitch_patches(void)
          *   4. Return.
          * 13 insns / 52 bytes. semGive @ 0x002ff5c4.
          *
-         * The flag location 0x07BEDD04 = struct_ptr 0x07BED9B4 + 848. struct_ptr
-         * back-computed from sem ID 0x07bee080 stored at struct+1248 (per disasm
-         * of tFecEndRx entry @ 0x12e294).
+         * Note: probe stub has a latent LR-loop bug (no mflr/mtlr around `bl
+         * semGive`) — when semGive returns, blr at probe_addr+0x30 returns
+         * to itself = infinite self-loop. Currently masked because DECR
+         * preempts every ~13ms. NOT fixed here (relocating to 0x002acfd0
+         * collides with the live function at 0x002acfb0).
+         *
+         * The flag location 0x07BEDD04 = struct_ptr 0x07BED9B4 + 848.
+         * struct_ptr back-computed from sem ID 0x07bee080 stored at
+         * struct+1248 (per disasm of tFecEndRx entry @ 0x12e294).
+         *
+         * Side-effect: probe stub's trailing blr at offset 0x30 lands at
+         * 0x002acfb0 — overwriting the FIRST instruction of the live
+         * function at 0x002acfb0. Calls to that function early-return
+         * harmlessly (no frame allocated). This is a known/lucky aliasing
+         * we depend on.
          */
         const uint32_t probe_addr = 0x002acf80;
         const uint32_t semgive_addr = 0x002ff5c4;
@@ -742,7 +806,7 @@ static void mpc5200_apply_keyswitch_patches(void)
             0x3c6007be,    /* +0x24  lis   r3,  0x07BE                      */
             0x6063e080,    /* +0x28  ori   r3,  r3, 0xE080 (sem ID)         */
             bl_semgive,    /* +0x2C  bl    0x002ff5c4 (semGive)              */
-            0x4e800020,    /* +0x30  blr                                    */
+            0x4e800020,    /* +0x30  blr  (lands at 0x002acfb0)              */
         };
         uint8_t probe_bytes[sizeof(probe_words)];
         for (unsigned i = 0; i < ARRAY_SIZE(probe_words); i++) {
@@ -769,10 +833,11 @@ static void mpc5200_apply_keyswitch_patches(void)
      * the writes landed (catches DRAM-mapping / read-only-region issues
      * that would otherwise be silent). */
     {
-        uint8_t v_site[4], v_stub[16], v_probe[16];
+        uint8_t v_site[4], v_stub[16], v_probe[16], v_guard_site[4];
         cpu_physical_memory_read(0x001180b8, v_site, sizeof(v_site));
         cpu_physical_memory_read(0x002acef0, v_stub, sizeof(v_stub));
         cpu_physical_memory_read(0x002acf80, v_probe, sizeof(v_probe));
+        cpu_physical_memory_read(0x001791dc, v_guard_site, sizeof(v_guard_site));
         fprintf(stderr,
                 "MPC5200: post-patch verify: 0x001180b8 = %02x%02x%02x%02x "
                 "(expect bl 0x002acef0 = 48194e39); "
@@ -780,7 +845,10 @@ static void mpc5200_apply_keyswitch_patches(void)
                 "(expect mflr r12 = 7d8802a6, bl intUnlock = 4be8bb89, "
                 "lis r10,0xF000 = 3d40f000, ori = 614a4000); "
                 "probe @ 0x002acf80 = %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x "
-                "(expect lis r9,0xCAFE = 3d20cafe, ori = 6129babe, lis r10,0xF000, ori = 614a4038)\n",
+                "(expect lis r9,0x07BE = 3d2007be, ori = 6129dd04, "
+                "li r10,8 = 39400008, stw r10,0(r9) = 91490000); "
+                "0x001791dc = %02x%02x%02x%02x (expect nop = 60000000, "
+                "was bctrl = 4e800421)\n",
                 v_site[0], v_site[1], v_site[2], v_site[3],
                 v_stub[0], v_stub[1], v_stub[2], v_stub[3],
                 v_stub[4], v_stub[5], v_stub[6], v_stub[7],
@@ -789,7 +857,8 @@ static void mpc5200_apply_keyswitch_patches(void)
                 v_probe[0], v_probe[1], v_probe[2], v_probe[3],
                 v_probe[4], v_probe[5], v_probe[6], v_probe[7],
                 v_probe[8], v_probe[9], v_probe[10], v_probe[11],
-                v_probe[12], v_probe[13], v_probe[14], v_probe[15]);
+                v_probe[12], v_probe[13], v_probe[14], v_probe[15],
+                v_guard_site[0], v_guard_site[1], v_guard_site[2], v_guard_site[3]);
     }
 
     fprintf(stderr,
@@ -802,6 +871,8 @@ static void mpc5200_apply_keyswitch_patches(void)
             "installed sysClkInt tail-patch @ 0x001180b8 -> stub @ 0x002acef0 "
             "(33-insn extended shim: netjob path -> netJobAdd @ 0x0022c288 + "
             "sem-queue path -> qPriBMapPut @ 0x002cd8e0); "
+            "nopped excExcHandle bctrl @ 0x001791dc (skips all hook-handler "
+            "calls at this site to avoid NULL-fn-ptr crash); "
             "probe stub @ 0x002acf80 (writes 0xCAFEBABE to MMIO 0xF0004038)\n",
             fshook_root());
     fflush(stderr);
