@@ -253,6 +253,7 @@ typedef struct {
             int  host_fd;
             bool in_use;
         } fd_proxy[FSHOOK_NUM_FDS];
+        unsigned read_log[FSHOOK_NUM_FDS];  /* per-slot read-call counter */
     } fshook;
 } MPC5200State;
 
@@ -2295,8 +2296,8 @@ static void fshook_handle_open(MPC5200State *s)
     s->fshook.result = fake;
     s->fshook.err    = 0;
     fprintf(stderr,
-            "FS_HOOK: open(\"%s\") -> fake_fd=%u host_fd=%d  (host=\"%s\")\n",
-            vx_path, fake, hfd, host_path);
+            "FS_OPEN: vx=\"%s\" host=\"%s\" -> fake_fd=%u host_fd=%d\n",
+            vx_path, host_path, fake, hfd);
     fflush(stderr);
 }
 
@@ -2333,10 +2334,25 @@ static void fshook_handle_read(MPC5200State *s)
     }
     s->fshook.result = (uint32_t)got;
     s->fshook.err    = 0;
-    fprintf(stderr,
-            "FS_HOOK: read(fd=%u, buf=0x%08x, n=%u) -> %zd\n",
-            fake_fd, buf_va, n, got);
-    fflush(stderr);
+    /* Per-fd rate limit: print byte counts for the first ~16 reads per slot
+     * so we can see the file-access pattern during BSP boot without an
+     * explosion once a service starts streaming bulk data. The counter is
+     * reset on close() so a slot reused for a different file gets a fresh
+     * 16-line budget. */
+    if (s->fshook.read_log[slot] < 16) {
+        s->fshook.read_log[slot]++;
+        fprintf(stderr,
+                "FS_READ: fd=%u n=%u -> %zd  (call #%u for slot %d)\n",
+                fake_fd, n, got, s->fshook.read_log[slot], slot);
+        fflush(stderr);
+    } else if (s->fshook.read_log[slot] == 16) {
+        s->fshook.read_log[slot]++;
+        fprintf(stderr,
+                "FS_READ: fd=%u n=%u -> %zd  (slot %d capped, further "
+                "reads silenced)\n",
+                fake_fd, n, got, slot);
+        fflush(stderr);
+    }
 }
 
 static void fshook_handle_close(MPC5200State *s)
@@ -2356,6 +2372,7 @@ static void fshook_handle_close(MPC5200State *s)
     int saved = errno;
     s->fshook.fd_proxy[slot].in_use  = false;
     s->fshook.fd_proxy[slot].host_fd = -1;
+    s->fshook.read_log[slot] = 0;  /* reset per-slot read-log budget */
     s->fshook.result = (rc == 0) ? 0 : (uint32_t)-1;
     s->fshook.err    = (rc == 0) ? 0 : saved;
     fprintf(stderr, "FS_HOOK: close(fd=%u host_fd=%d) -> %d\n",
@@ -2445,14 +2462,14 @@ static void fshook_handle_exists(MPC5200State *s)
     if (rc == 0) {
         s->fshook.result = 1;
         s->fshook.err    = 0;
-        fprintf(stderr, "FS_HOOK: exists(\"%s\") -> 1  (host=\"%s\")\n",
+        fprintf(stderr, "FS_EXISTS: vx=\"%s\" host=\"%s\" -> 1\n",
                 vx_path, host_path);
     } else {
         int saved = errno;
         s->fshook.result = 0;
         s->fshook.err    = saved;
         fprintf(stderr,
-                "FS_HOOK: exists(\"%s\") -> 0  (host=\"%s\": %s)\n",
+                "FS_EXISTS: vx=\"%s\" host=\"%s\" -> 0 (%s)\n",
                 vx_path, host_path, strerror(saved));
     }
     fflush(stderr);
