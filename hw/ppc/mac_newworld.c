@@ -642,62 +642,88 @@ static void mpc5200_apply_keyswitch_patches(void)
         const uint32_t netjobadd_addr = 0x0022c288; /* netJobAdd — runtime sig-match (plan 2026-05-11) */
         const uint32_t patch_site    = 0x001180b8;
 
-        /* Encode bl/b: insn = 0x48000000 | (offset & 0x03FFFFFC) | LK. */
+        /* Encode bl/b: insn = 0x48000000 | (offset & 0x03FFFFFC) | LK.
+         *
+         * Plan 2026-05-13 (Phase B): shim grew from 33 to 35 insns to
+         * insert *(0x07BEDD04)=8 (tFecEndRx work-flag) at start of the
+         * sem-queue path body. Net effect on offsets:
+         *   - netJobAdd tail-call moves from +0x3C to +0x34 (because we
+         *     dropped 2 unused arg loads in the netjob path)
+         *   - qPriBMapPut tail-call moves from +0x7C to +0x84 (because
+         *     the +2 net insns push the rest of the sem-queue path
+         *     deeper)
+         */
         uint32_t bl_intunlock =
             0x48000000u | ((intunlock_addr  - (stub_addr + 0x04)) & 0x03FFFFFC) | 1u;
         uint32_t b_netjobadd =
-            0x48000000u | ((netjobadd_addr  - (stub_addr + 0x3C)) & 0x03FFFFFC);
+            0x48000000u | ((netjobadd_addr  - (stub_addr + 0x34)) & 0x03FFFFFC);
         uint32_t b_qpribmap =
-            0x48000000u | ((qpribmap_addr   - (stub_addr + 0x7C)) & 0x03FFFFFC);
+            0x48000000u | ((qpribmap_addr   - (stub_addr + 0x84)) & 0x03FFFFFC);
         uint32_t bl_to_stub =
             0x48000000u | ((stub_addr       - patch_site)         & 0x03FFFFFC) | 1u;
 
         /*
-         * Extended sysClkInt tail-patch shim (33 instructions, 132 bytes).
+         * Extended sysClkInt tail-patch shim (35 instructions, 140 bytes).
          * Two doorbells, each one-shot per tick, in priority order:
          *   1. NETJOB_FUNC (0xF0004020) — if non-zero, tail-call netJobAdd
-         *      with args from NETJOB_ARG[1..5]. Used to inject deferred work
-         *      onto netTask (plan 2026-05-11 step 3).
-         *   2. SEM_QUEUE   (0xF000401C) — original tFecEndRx wake path; flips
-         *      TCB+0x3C to 0, clears pSemId, tail-calls qPriBMapPut on readyQ.
+         *      with args from NETJOB_ARG[1..3]. Used to inject deferred work
+         *      onto netTask (plan 2026-05-11 step 3). Plan 2026-05-13:
+         *      dropped arg4/arg5 loads — probe stub takes 0 args, no
+         *      current caller fills NETJOB_ARG[3..4].
+         *   2. SEM_QUEUE   (0xF000401C) — original tFecEndRx wake path. Plan
+         *      2026-05-13 (Phase B): also writes 8 to *(0x07BEDD04) (=
+         *      tFecEndRx struct+848, the work-flag) BEFORE clearing TCB,
+         *      so that when tFecEndRx wakes via this path and checks the
+         *      flag at 0x0012e2a8 it takes the work-processing path
+         *      instead of the early-exit cleanup path. This decouples the
+         *      work-flag from the probe stub's LR-loop entirely.
+         * Then flips TCB+0x3C to 0, clears pSemId, tail-calls qPriBMapPut
+         * on readyQ.
          * Both paths preserve sysClkInt's continuation in r12 and use mtlr
          * before tail-call. Each doorbell is cleared by the shim BEFORE the
          * tail-call so the shim doesn't re-fire on the same arg.
+         *
+         * Free-space check: shim end = stub_addr + 0x8C = 0x002acf7c. The
+         * probe stub starts at 0x002acf80 — 4 B clearance.
          */
-        const uint32_t stub_words[33] = {
+        const uint32_t stub_words[35] = {
             0x7d8802a6,    /* +0x00  mflr  r12                              */
             bl_intunlock,  /* +0x04  bl    0x00138a7c (intUnlock)            */
             0x3d40f000,    /* +0x08  lis   r10, 0xF000                      */
             0x614a4000,    /* +0x0C  ori   r10, r10, 0x4000  (FSHOOK base)  */
             0x806a0020,    /* +0x10  lwz   r3,  0x20(r10)  (netjob_func)    */
             0x2c030000,    /* +0x14  cmpwi r3, 0                            */
-            0x41820028,    /* +0x18  beq   +0x28  (-> +0x40 sem-queue path) */
+            0x41820020,    /* +0x18  beq   +0x20  (-> +0x38 sem-queue path) */
             0x808a0024,    /* +0x1C  lwz   r4,  0x24(r10)  (arg1)           */
             0x80aa0028,    /* +0x20  lwz   r5,  0x28(r10)  (arg2)           */
             0x80ca002c,    /* +0x24  lwz   r6,  0x2c(r10)  (arg3)           */
-            0x80ea0030,    /* +0x28  lwz   r7,  0x30(r10)  (arg4)           */
-            0x810a0034,    /* +0x2C  lwz   r8,  0x34(r10)  (arg5)           */
-            0x38000000,    /* +0x30  li    r0, 0                            */
-            0x900a0020,    /* +0x34  stw   r0,  0x20(r10) (clr netjob)      */
-            0x7d8803a6,    /* +0x38  mtlr  r12                               */
-            b_netjobadd,   /* +0x3C  b     netJobAdd (tail-call)             */
-            0x806a001c,    /* +0x40  lwz   r3,  0x1c(r10) (sem_queue)       */
-            0x7d8803a6,    /* +0x44  mtlr  r12                               */
-            0x2c030000,    /* +0x48  cmpwi r3, 0                            */
-            0x41820034,    /* +0x4C  beq   +0x34  (-> +0x80 blr)             */
-            0x39200000,    /* +0x50  li    r9, 0                            */
-            0x912a001c,    /* +0x54  stw   r9,  0x1c(r10) (clr sem_queue)   */
-            0x3d2007bf,    /* +0x58  lis   r9, 0x07BF                       */
-            0x3929de38,    /* +0x5C  addi  r9, r9, -0x21C8 (= 0x07BEDE38)    */
-            0x38000000,    /* +0x60  li    r0, 0                            */
-            0x9009003c,    /* +0x64  stw   r0, 0x3C(r9) (TCB.status = 0)   */
-            0x9009005c,    /* +0x68  stw   r0, 0x5C(r9) (TCB.pSemId = 0)   */
-            0x3c60009a,    /* +0x6C  lis   r3, 0x009A                       */
-            0x3863af58,    /* +0x70  addi  r3, r3, -0x50A8 (= 0x0099AF58)   */
-            0x7d240b78,    /* +0x74  mr    r4, r9 [TCB]                     */
-            0x38a0001d,    /* +0x78  li    r5, 29 [priority]                */
-            b_qpribmap,    /* +0x7C  b     0x002cd8e0 (tail-call qPriBMapPut)*/
-            0x4e800020,    /* +0x80  blr   (no-doorbell path)                */
+            0x38000000,    /* +0x28  li    r0, 0                            */
+            0x900a0020,    /* +0x2C  stw   r0,  0x20(r10) (clr netjob)      */
+            0x7d8803a6,    /* +0x30  mtlr  r12                               */
+            b_netjobadd,   /* +0x34  b     netJobAdd (tail-call)             */
+            0x806a001c,    /* +0x38  lwz   r3,  0x1c(r10) (sem_queue)       */
+            0x7d8803a6,    /* +0x3C  mtlr  r12                               */
+            0x2c030000,    /* +0x40  cmpwi r3, 0                            */
+            0x41820044,    /* +0x44  beq   +0x44  (-> +0x88 blr)             */
+            0x39200000,    /* +0x48  li    r9, 0                            */
+            0x912a001c,    /* +0x4C  stw   r9,  0x1c(r10) (clr sem_queue)   */
+            /* Phase B: set tFecEndRx work-flag *(0x07BEDD04) = 8.          */
+            0x3d2007be,    /* +0x50  lis   r9, 0x07BE                       */
+            0x6129dd04,    /* +0x54  ori   r9, r9, 0xDD04 (= 0x07BEDD04)    */
+            0x38000008,    /* +0x58  li    r0, 8                            */
+            0x90090000,    /* +0x5C  stw   r0, 0(r9) (struct+848 = 8)       */
+            /* Original sem-queue path: clear TCB, enqueue readyQ.          */
+            0x3d2007bf,    /* +0x60  lis   r9, 0x07BF                       */
+            0x3929de38,    /* +0x64  addi  r9, r9, -0x21C8 (= 0x07BEDE38)    */
+            0x38000000,    /* +0x68  li    r0, 0                            */
+            0x9009003c,    /* +0x6C  stw   r0, 0x3C(r9) (TCB.status = 0)   */
+            0x9009005c,    /* +0x70  stw   r0, 0x5C(r9) (TCB.pSemId = 0)   */
+            0x3c60009a,    /* +0x74  lis   r3, 0x009A                       */
+            0x3863af58,    /* +0x78  addi  r3, r3, -0x50A8 (= 0x0099AF58)   */
+            0x7d240b78,    /* +0x7C  mr    r4, r9 [TCB]                     */
+            0x38a0001d,    /* +0x80  li    r5, 29 [priority]                */
+            b_qpribmap,    /* +0x84  b     0x002cd8e0 (tail-call qPriBMapPut)*/
+            0x4e800020,    /* +0x88  blr   (no-doorbell path)                */
         };
         /* Convert to BE byte array for cpu_physical_memory_write. */
         uint8_t stub_bytes[sizeof(stub_words)];
@@ -895,8 +921,9 @@ static void mpc5200_apply_keyswitch_patches(void)
             "(doorbell @ 0xF0004000, root=%s); "
             "no-op'd printf at 0x2acee8 (PSC1 TX IRQ workaround); "
             "installed sysClkInt tail-patch @ 0x001180b8 -> stub @ 0x002acef0 "
-            "(33-insn extended shim: netjob path -> netJobAdd @ 0x0022c288 + "
-            "sem-queue path -> qPriBMapPut @ 0x002cd8e0); "
+            "(35-insn extended shim: netjob path -> netJobAdd @ 0x0022c288 + "
+            "sem-queue path sets *(0x07BEDD04)=8 [tFecEndRx work-flag] then "
+            "tail-calls qPriBMapPut @ 0x002cd8e0); "
             "nopped excExcHandle bctrl @ 0x001791a8 + 0x001791dc (skips all "
             "hook-handler calls at both indirect-call sites to avoid "
             "NULL-fn-ptr crashes); "
