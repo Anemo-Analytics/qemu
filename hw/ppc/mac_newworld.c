@@ -1339,6 +1339,53 @@ static void mpc5200_tick(void *opaque)
     /* Patches now applied from mpc5200_diag_sample (fires at 1us, much
      * earlier than this 60Hz tick which is delayed 1s by design). */
 
+    /*
+     * EE-FORCE (2026-04-30): the BSP scheduler enters its critical section
+     * (`0x00207f6c` clears EE), scans the ready queue, finds nothing, and
+     * loops forever — by vt~14s the CPU is stuck at NIP 0x100498 / 0x145430
+     * with MSR.EE=0 indefinitely. DEC underflows and stays pending in
+     * pending_interrupts but never delivers because EE=0.
+     *
+     * This is the documented "EE=0 hold" wall (SESSION_LOG_2026-05-05.md).
+     * Original plan (2026-04-30 revised) assumed the wedge was in
+     * netjob_func clearing — Phase A confirmed that path is fine; the
+     * actual wedge is upstream.
+     *
+     * Workaround: if DECR has been pending with EE=0 for ≥ 2 host ticks
+     * (~33 ms of host time), force MSR.EE=1 and re-evaluate pending IRQs.
+     * That lets the queued DEC fire, sysClkInt runs, and the netjob/sem-
+     * queue doorbell mechanism resumes. Risk: re-entering the scheduler
+     * critical section with stale state could corrupt kernel data.
+     * Acceptance criterion: any SYN-ACK from the guest, or daemon banner.
+     */
+    if (tick_count >= 60 * 12) {
+        CPUPPCState *env = &s->cpu->env;
+        bool ee   = (env->msr & (1u << 15)) != 0;
+        bool decr = (env->pending_interrupts & PPC_INTERRUPT_DECR) != 0;
+        static unsigned wedge_streak;
+        static unsigned forces;
+        if (!ee && decr) {
+            wedge_streak++;
+        } else {
+            wedge_streak = 0;
+        }
+        if (wedge_streak >= 2 && forces < 200) {
+            env->msr |= (1u << 15);   /* force EE=1 */
+            ppc_maybe_interrupt(env); /* re-evaluate pending IRQs */
+            forces++;
+            wedge_streak = 0;
+            if (forces <= 8 || (forces % 20) == 0) {
+                fprintf(stderr,
+                        "EE-FORCE #%u: t=%d.%02ds was nip=0x%08x msr=0x%08x; "
+                        "set EE=1, requested IRQ delivery\n",
+                        forces, tick_count / 60,
+                        (tick_count % 60) * 100 / 60,
+                        (uint32_t)env->nip, (uint32_t)env->msr);
+                fflush(stderr);
+            }
+        }
+    }
+
     if (!ext_armed) {
         uint32_t w = ldl_be_phys(&address_space_memory, 0x508);
         if (w != MPC5200_VEC_GARBAGE_AT_508) {
