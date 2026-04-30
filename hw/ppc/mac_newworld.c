@@ -644,47 +644,53 @@ static void mpc5200_apply_keyswitch_patches(void)
 
         /* Encode bl/b: insn = 0x48000000 | (offset & 0x03FFFFFC) | LK.
          *
-         * Plan 2026-05-13 (Phase B): shim grew from 33 to 35 insns to
-         * insert *(0x07BEDD04)=8 (tFecEndRx work-flag) at start of the
-         * sem-queue path body. Net effect on offsets:
-         *   - netJobAdd tail-call moves from +0x3C to +0x34 (because we
-         *     dropped 2 unused arg loads in the netjob path)
-         *   - qPriBMapPut tail-call moves from +0x7C to +0x84 (because
-         *     the +2 net insns push the rest of the sem-queue path
-         *     deeper)
+         * Plan 2026-04-30 (FEC+FTP boot): per-sem dispatch in sem-queue
+         * path. Drops work-flag write (4 insns) and trailing blr (1 insn,
+         * replaced by `beqlr`). Adds 4-insn dispatch + tRoot setup +
+         * common-path tail. Net offset changes from prior 35-insn layout:
+         *   - netJobAdd tail-call stays at +0x34
+         *   - qPriBMapPut tail-call moves from +0x84 to +0x88 (last insn).
          */
         uint32_t bl_intunlock =
             0x48000000u | ((intunlock_addr  - (stub_addr + 0x04)) & 0x03FFFFFC) | 1u;
         uint32_t b_netjobadd =
             0x48000000u | ((netjobadd_addr  - (stub_addr + 0x34)) & 0x03FFFFFC);
         uint32_t b_qpribmap =
-            0x48000000u | ((qpribmap_addr   - (stub_addr + 0x84)) & 0x03FFFFFC);
+            0x48000000u | ((qpribmap_addr   - (stub_addr + 0x88)) & 0x03FFFFFC);
         uint32_t bl_to_stub =
             0x48000000u | ((stub_addr       - patch_site)         & 0x03FFFFFC) | 1u;
 
         /*
          * Extended sysClkInt tail-patch shim (35 instructions, 140 bytes).
-         * Two doorbells, each one-shot per tick, in priority order:
+         * Two doorbells, each one-shot per tick:
          *   1. NETJOB_FUNC (0xF0004020) — if non-zero, tail-call netJobAdd
-         *      with args from NETJOB_ARG[1..3]. Used to inject deferred work
-         *      onto netTask (plan 2026-05-11 step 3). Plan 2026-05-13:
-         *      dropped arg4/arg5 loads — probe stub takes 0 args, no
-         *      current caller fills NETJOB_ARG[3..4].
-         *   2. SEM_QUEUE   (0xF000401C) — original tFecEndRx wake path. Plan
-         *      2026-05-13 (Phase B): also writes 8 to *(0x07BEDD04) (=
-         *      tFecEndRx struct+848, the work-flag) BEFORE clearing TCB,
-         *      so that when tFecEndRx wakes via this path and checks the
-         *      flag at 0x0012e2a8 it takes the work-processing path
-         *      instead of the early-exit cleanup path. This decouples the
-         *      work-flag from the probe stub's LR-loop entirely.
-         * Then flips TCB+0x3C to 0, clears pSemId, tail-calls qPriBMapPut
-         * on readyQ.
+         *      with args from NETJOB_ARG[1..3].
+         *   2. SEM_QUEUE   (0xF000401C) — wake one of two PEND'd tasks based
+         *      on bit 9 of the sem ID:
+         *        sem & 0x200 == 0  -> wake tFecEndRx (TCB 0x07BEDE38, prio 29)
+         *        sem & 0x200 != 0  -> wake tRootTask (TCB 0x07FEFE00, prio 0)
+         *      Both wake paths flip TCB+0x3C=0, clear pSemId, tail-call
+         *      qPriBMapPut on readyQ 0x0099AF58.
+         *
+         * Plan 2026-04-30 (FEC+FTP single-node boot): per-sem dispatch
+         * fallback (Plan risk #1). The dual-slot extension didn't fit:
+         * shim already ends at 0x002acf7c with only 4 B clearance to the
+         * probe stub at 0x002acf80. Per-sem dispatch in the existing slot
+         * is the bounded alternative — same instruction count.
+         *
+         * To make room for the dispatch (4 insns), this version drops:
+         *   - work-flag write *(0x07BEDD04)=8 (4 insns) — per Plan "What
+         *     we are explicitly NOT doing": tFecEndRx body progression no
+         *     longer relevant; usrToolsInit's FEC respawn supersedes.
+         *   - trailing blr at +0x88 (1 insn) — replaced by `beqlr` at the
+         *     cmpwi for empty-doorbell case.
+         *
          * Both paths preserve sysClkInt's continuation in r12 and use mtlr
          * before tail-call. Each doorbell is cleared by the shim BEFORE the
          * tail-call so the shim doesn't re-fire on the same arg.
          *
          * Free-space check: shim end = stub_addr + 0x8C = 0x002acf7c. The
-         * probe stub starts at 0x002acf80 — 4 B clearance.
+         * probe stub starts at 0x002acf80 — 4 B clearance preserved.
          */
         const uint32_t stub_words[35] = {
             0x7d8802a6,    /* +0x00  mflr  r12                              */
@@ -704,26 +710,29 @@ static void mpc5200_apply_keyswitch_patches(void)
             0x806a001c,    /* +0x38  lwz   r3,  0x1c(r10) (sem_queue)       */
             0x7d8803a6,    /* +0x3C  mtlr  r12                               */
             0x2c030000,    /* +0x40  cmpwi r3, 0                            */
-            0x41820044,    /* +0x44  beq   +0x44  (-> +0x88 blr)             */
+            0x4d820020,    /* +0x44  beqlr (no doorbell - return via mtlr'd LR)*/
             0x39200000,    /* +0x48  li    r9, 0                            */
             0x912a001c,    /* +0x4C  stw   r9,  0x1c(r10) (clr sem_queue)   */
-            /* Phase B: set tFecEndRx work-flag *(0x07BEDD04) = 8.          */
-            0x3d2007be,    /* +0x50  lis   r9, 0x07BE                       */
-            0x6129dd04,    /* +0x54  ori   r9, r9, 0xDD04 (= 0x07BEDD04)    */
-            0x38000008,    /* +0x58  li    r0, 8                            */
-            0x90090000,    /* +0x5C  stw   r0, 0(r9) (struct+848 = 8)       */
-            /* Original sem-queue path: clear TCB, enqueue readyQ.          */
-            0x3d2007bf,    /* +0x60  lis   r9, 0x07BF                       */
-            0x3929de38,    /* +0x64  addi  r9, r9, -0x21C8 (= 0x07BEDE38)    */
-            0x38000000,    /* +0x68  li    r0, 0                            */
-            0x9009003c,    /* +0x6C  stw   r0, 0x3C(r9) (TCB.status = 0)   */
-            0x9009005c,    /* +0x70  stw   r0, 0x5C(r9) (TCB.pSemId = 0)   */
-            0x3c60009a,    /* +0x74  lis   r3, 0x009A                       */
-            0x3863af58,    /* +0x78  addi  r3, r3, -0x50A8 (= 0x0099AF58)   */
-            0x7d240b78,    /* +0x7C  mr    r4, r9 [TCB]                     */
-            0x38a0001d,    /* +0x80  li    r5, 29 [priority]                */
-            b_qpribmap,    /* +0x84  b     0x002cd8e0 (tail-call qPriBMapPut)*/
-            0x4e800020,    /* +0x88  blr   (no-doorbell path)                */
+            /* Per-sem dispatch on bit 9 of the sem ID: 0x07bee080 (tFec)
+             * has bit 9 = 0, 0x07bee378 (tRoot) has bit 9 = 1.            */
+            0x70690200,    /* +0x50  andi. r9, r3, 0x0200 (sets CR0)        */
+            0x38000000,    /* +0x54  li    r0, 0                            */
+            0x41820014,    /* +0x58  beq   +0x14  (-> +0x6C tFec setup)     */
+            /* tRoot setup: TCB 0x07FEFE00, prio 0 — fall through.          */
+            0x3c8007ff,    /* +0x5C  lis   r4, 0x07FF                       */
+            0x3884fe00,    /* +0x60  addi  r4, r4, -0x0200 (= 0x07FEFE00)   */
+            0x38a00000,    /* +0x64  li    r5, 0                            */
+            0x48000010,    /* +0x68  b     +0x10  (-> +0x78 common)         */
+            /* tFec setup: TCB 0x07BEDE38, prio 29.                         */
+            0x3c8007bf,    /* +0x6C  lis   r4, 0x07BF                       */
+            0x3884de38,    /* +0x70  addi  r4, r4, -0x21C8 (= 0x07BEDE38)   */
+            0x38a0001d,    /* +0x74  li    r5, 29                           */
+            /* Common path: clear TCB.status, TCB.pSemId; enqueue on readyQ.*/
+            0x9004003c,    /* +0x78  stw   r0, 0x3C(r4) (TCB.status = 0)   */
+            0x9004005c,    /* +0x7C  stw   r0, 0x5C(r4) (TCB.pSemId = 0)   */
+            0x3c60009a,    /* +0x80  lis   r3, 0x009A                       */
+            0x3863af58,    /* +0x84  addi  r3, r3, -0x50A8 (= 0x0099AF58)   */
+            b_qpribmap,    /* +0x88  b     0x002cd8e0 (tail-call qPriBMapPut)*/
         };
         /* Convert to BE byte array for cpu_physical_memory_write. */
         uint8_t stub_bytes[sizeof(stub_words)];
@@ -921,9 +930,10 @@ static void mpc5200_apply_keyswitch_patches(void)
             "(doorbell @ 0xF0004000, root=%s); "
             "no-op'd printf at 0x2acee8 (PSC1 TX IRQ workaround); "
             "installed sysClkInt tail-patch @ 0x001180b8 -> stub @ 0x002acef0 "
-            "(35-insn extended shim: netjob path -> netJobAdd @ 0x0022c288 + "
-            "sem-queue path sets *(0x07BEDD04)=8 [tFecEndRx work-flag] then "
-            "tail-calls qPriBMapPut @ 0x002cd8e0); "
+            "(35-insn shim: netjob path -> netJobAdd @ 0x0022c288 + "
+            "sem-queue path per-sem dispatch on bit 9 of sem ID -> "
+            "wake tFecEndRx (TCB 0x07BEDE38, prio 29) or tRootTask "
+            "(TCB 0x07FEFE00, prio 0) via qPriBMapPut @ 0x002cd8e0); "
             "nopped excExcHandle bctrl @ 0x001791a8 + 0x001791dc (skips all "
             "hook-handler calls at both indirect-call sites to avoid "
             "NULL-fn-ptr crashes); "
@@ -1095,6 +1105,16 @@ static BootStation g_boot_stations[] = {
     { 0x00107a58, 0x00107a5b, "VX: bl wncan_attach",                     false, 0 },
     { 0x00107a5c, 0x00107a5f, "VX: bl usrAppInit",                       false, 0 },
     { 0x00107a68, 0x00107a6b, "VX: bl usrStartupScript",                 false, 0 },
+
+    /* === FTP path stations (plan 2026-04-30 Phase B) ===
+     * tRootTask post-wake: 0x00177b34 is the loop-test after the bl at
+     * 0x00177b2c per plan. Hit means tRootTask resumed past the wedge.
+     * ftpdInit body: 0x0017de2c is the addi forming "(%d) ftpdTask
+     * created" string addr (0x00399530); the bl at 0x0017de34 is the
+     * printf call. If 0x0017de2c hits, ftpdTask was successfully
+     * created — stronger signal than just usrToolsInit. */
+    { 0x00177b34, 0x00177b37, "VX: tRootTask post-wake (after wedge)",   false, 0 },
+    { 0x0017de2c, 0x0017de2f, "VX: ftpdTask-created printf (in ftpdInit)", false, 0 },
 };
 
 /* NIP histogram across full bootrom .text — reveals idle loops. */
@@ -1577,6 +1597,45 @@ static void mpc5200_tick(void *opaque)
     }
 
     /*
+     * ROOTTASK-DOORBELL (plan 2026-04-30 pivot): tRootTask PEND'd on sem
+     * 0x07bee378 (WAIT_FOREVER, errno=0x00030065) inside usrAppInit's
+     * service-init chain. Stack chain (frame 20 lr=0x00107a60) confirms
+     * task is past `bl usrAppInit` at 0x00107a5c.
+     *
+     * Saved PC=0x00177b30 is post-`bl 0x00207efc` (windExit) inside the
+     * sem-class take-loop fn at 0x001779e0. The wait was reached via
+     * usrAppInit → 0x0014ce34 → ... → fn @ 0x0012b658 doing
+     * `lwz r3, 136(r3); bl 0x002ff730` (semTake on object+136 = sem
+     * 0x07bee378). Owning object @ 0x07bee2F0.
+     *
+     * Sem is dynamically allocated (not in .data/BSS); no semGive call
+     * site found in trace, and all 11 downstream PEND'd services are
+     * gated behind tRootTask. Classic orphan-sem: the would-be giver
+     * never runs because its parent init is blocked here.
+     *
+     * Strategy: reuse the SYNTH-DOORBELL infra to semGive sem 0x07bee378
+     * via the BSP shim's sysClkInt tail-patch. Post at multiple vt's so
+     * (1) if tRootTask hasn't reached the semTake yet, the sem count is
+     * pre-incremented; (2) if it's already PEND, the wake fires; (3) if
+     * the wait-loop iterates and re-blocks, subsequent posts unblock.
+     *
+     * Guarded with `sem_queue == 0` so we don't clobber the FEC RX post
+     * at vt=8s. Each post is consumed within ~17ms (one sysClkInt tick).
+     */
+    if ((tick_count == 60 * 5 || tick_count == 60 * 10 ||
+         tick_count == 60 * 12 || tick_count == 60 * 15 ||
+         tick_count == 60 * 20 || tick_count == 60 * 25 ||
+         tick_count == 60 * 30 || tick_count == 60 * 35) &&
+        s->fshook.sem_queue == 0) {
+        fprintf(stderr,
+                "ROOTTASK-DOORBELL: writing s->fshook.sem_queue = 0x07bee378 "
+                "at vt=%ds — wake tRootTask from PEND inside usrAppInit chain\n",
+                tick_count / 60);
+        fflush(stderr);
+        s->fshook.sem_queue = 0x07bee378;
+    }
+
+    /*
      * ENTRY-PROBE (plan 2026-05-11): one-shot dump at vt=2s of TCB+0x80..+0xC0
      * for tFecEndRx (0x07BEDE38). Goal: identify the entry-PC offset (standard
      * VxWorks puts the task entry function pointer somewhere near here).
@@ -1601,6 +1660,65 @@ static void mpc5200_tick(void *opaque)
         uint32_t entry = ldl_be_phys(as, TCB + 0x74);
         fprintf(stderr, "ENTRY-PROBE: tFecEndRx entry=0x%08x (TCB+0x74), "
                 "struct_ptr=0x07bed9b4, sem=0x07bee080, flag@0x07bedd04\n", entry);
+        fflush(stderr);
+    }
+
+    /*
+     * ROOTTASK-COORDS probe (plan 2026-04-30, Phase A). One-shot at vt=3s.
+     * Walks activeQ DLL anchored at *(0x008d94e4), finds the TCB whose name
+     * (TCB+0x34 → ASCIIZ) starts with "tRootTask", and prints:
+     *   - TCB address
+     *   - priority (TCB+0x40)
+     *   - readyQ head/bmap/vtable (assumes same global readyQ at 0x0099AF58)
+     *   - TCB.status, TCB.pSemId, saved PC
+     * These are the constants needed for the Phase B shim wake-stub.
+     * Read-only; no state changes.
+     */
+    if (tick_count == 60 * 3 || tick_count == 60 * 8) {
+        AddressSpace *as = &address_space_memory;
+        const uint32_t ACTIVEQ_HEAD = 0x008d94e4;
+        const uint32_t READYQ       = 0x0099af58;
+        uint32_t cur = ldl_be_phys(as, ACTIVEQ_HEAD);
+        uint32_t found_tcb = 0;
+        uint32_t found_prio = 0;
+        uint32_t found_status = 0;
+        uint32_t found_pSemId = 0;
+        uint32_t found_pc = 0;
+        for (int n = 0; n < 64 && cur && cur != ACTIVEQ_HEAD; n++) {
+            uint32_t tcb     = cur - 0x20;
+            uint32_t name_pa = ldl_be_phys(as, tcb + 0x34);
+            char nm[16] = {0};
+            if (name_pa && name_pa < 0x10000000) {
+                cpu_physical_memory_read(name_pa, (uint8_t *)nm, 15);
+            }
+            if (strncmp(nm, "tRootTask", 9) == 0) {
+                found_tcb    = tcb;
+                found_prio   = ldl_be_phys(as, tcb + 0x40);
+                found_status = ldl_be_phys(as, tcb + 0x3C);
+                found_pSemId = ldl_be_phys(as, tcb + 0x5C);
+                found_pc     = ldl_be_phys(as, tcb + 0x130 + 0x8C);
+                break;
+            }
+            cur = ldl_be_phys(as, cur);
+        }
+        if (found_tcb) {
+            uint32_t rqhead = ldl_be_phys(as, READYQ + 0x00);
+            uint32_t rqbmap = ldl_be_phys(as, READYQ + 0x04);
+            uint32_t rqvtbl = ldl_be_phys(as, READYQ + 0x0C);
+            fprintf(stderr,
+                    "ROOTTASK-COORDS: tcb=0x%08x pri=%u status=0x%x "
+                    "pSemId=0x%08x PC=0x%08x\n"
+                    "ROOTTASK-COORDS:   readyQ=0x%08x head=0x%08x "
+                    "bmap=0x%08x vtbl=0x%08x\n",
+                    found_tcb, found_prio, found_status,
+                    found_pSemId, found_pc,
+                    READYQ, rqhead, rqbmap, rqvtbl);
+        } else {
+            fprintf(stderr,
+                    "ROOTTASK-COORDS: NOT FOUND in activeQ at vt=3s "
+                    "(activeQHead=0x%08x first=0x%08x)\n",
+                    ACTIVEQ_HEAD, ldl_be_phys(as, ACTIVEQ_HEAD));
+        }
         fflush(stderr);
     }
 
@@ -1885,27 +2003,33 @@ static void mpc5200_tick(void *opaque)
         fflush(stderr);
     }
 
-    if (tick_count >= 60 * 8 && tick_count <= 60 * 30 && (tick_count % 30) == 0) {
+    if (tick_count >= 60 * 8 && tick_count <= 60 * 90 && (tick_count % 30) == 0) {
         AddressSpace *as = &address_space_memory;
-        const uint32_t tcb = 0x07bede38;
-        uint32_t status = ldl_be_phys(as, tcb + 0x3C);
-        uint32_t pSemId = ldl_be_phys(as, tcb + 0x5C);
-        uint32_t errnov = ldl_be_phys(as, tcb + 0x84);
-        uint32_t pc     = ldl_be_phys(as, tcb + 0x130 + 0x8C);
-        uint32_t lr     = ldl_be_phys(as, tcb + 0x130 + 0x84);
-        const char *st = "?";
-        switch (status) {
-        case 0x0:     st = "READY"; break;
-        case 0x2:     st = "PEND"; break;
-        case 0x4:     st = "DELAY"; break;
-        case 0x6:     st = "PEND+TO"; break;
-        case 0x10000: st = "SUSP"; break;
+        static const struct { uint32_t tcb; const char *name; } watchlist[] = {
+            { 0x07bede38, "tFecEndRx" },
+            { 0x07fefe00, "tRootTask" },  /* Phase A coords */
+        };
+        for (int w = 0; w < (int)ARRAY_SIZE(watchlist); w++) {
+            const uint32_t tcb = watchlist[w].tcb;
+            uint32_t status = ldl_be_phys(as, tcb + 0x3C);
+            uint32_t pSemId = ldl_be_phys(as, tcb + 0x5C);
+            uint32_t errnov = ldl_be_phys(as, tcb + 0x84);
+            uint32_t pc     = ldl_be_phys(as, tcb + 0x130 + 0x8C);
+            uint32_t lr     = ldl_be_phys(as, tcb + 0x130 + 0x84);
+            const char *st = "?";
+            switch (status) {
+            case 0x0:     st = "READY"; break;
+            case 0x2:     st = "PEND"; break;
+            case 0x4:     st = "DELAY"; break;
+            case 0x6:     st = "PEND+TO"; break;
+            case 0x10000: st = "SUSP"; break;
+            }
+            fprintf(stderr,
+                    "TCB-WATCH: t=%d.%02ds %-9s tcb=0x%08x status=0x%-5x %-7s "
+                    "sem=0x%08x errno=0x%08x PC=0x%08x LR=0x%08x\n",
+                    tick_count / 60, (tick_count % 60) * 100 / 60,
+                    watchlist[w].name, tcb, status, st, pSemId, errnov, pc, lr);
         }
-        fprintf(stderr,
-                "TCB-WATCH: t=%d.%02ds tFecEndRx tcb=0x%08x status=0x%x %-7s "
-                "sem=0x%08x errno=0x%08x PC=0x%08x LR=0x%08x\n",
-                tick_count / 60, (tick_count % 60) * 100 / 60,
-                tcb, status, st, pSemId, errnov, pc, lr);
         fflush(stderr);
     }
 
