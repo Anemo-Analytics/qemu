@@ -733,32 +733,53 @@ static void mpc5200_apply_keyswitch_patches(void)
          * Simpler fix per the plan's "Or simpler" alternative: replace the
          * bctrl at 0x001791dc with a nop. ALL handler calls at this site
          * are skipped — even valid ones. Tradeoff per session log: this
-         * site is one of two indirect-call sites in the dispatcher; the
-         * other (at 0x001791a8 with r11) still works. We lose any debug/
-         * log hook handlers registered through this slot, but the kernel
-         * itself is robust to missing hook calls.
+         * site is one of two indirect-call sites in the dispatcher.
+         *
+         * Plan 2026-05-13 (Phase A): the *other* indirect-call site at
+         * 0x001791a8 (`mtctr r11; crclr 6; bctrl`) hits the same NULL
+         * fn-ptr scenario — it's the source of the residual vt=9s HV_EMU
+         * (NIP=0, MSR=0, LR=0). Apply identical fix: nop the bctrl. We
+         * lose any debug/log hook handlers registered through *either*
+         * slot, but the kernel itself is robust to missing hook calls.
          */
-        const uint32_t guard_call_site = 0x001791dc;
+        const uint32_t guard_call_site_dc = 0x001791dc;
+        const uint32_t guard_call_site_a8 = 0x001791a8;
 
-        /* Pre-flight: confirm bctrl bytes at 0x001791dc match. */
+        /* Pre-flight: confirm bctrl bytes at both call sites match. */
         {
-            uint8_t pre_call[4];
-            cpu_physical_memory_read(guard_call_site, pre_call, sizeof(pre_call));
+            uint8_t pre_call_dc[4], pre_call_a8[4];
+            cpu_physical_memory_read(guard_call_site_dc, pre_call_dc,
+                                     sizeof(pre_call_dc));
+            cpu_physical_memory_read(guard_call_site_a8, pre_call_a8,
+                                     sizeof(pre_call_a8));
             static const uint8_t exp_call[4] = { 0x4e, 0x80, 0x04, 0x21 };
-            if (memcmp(pre_call, exp_call, sizeof(exp_call)) != 0) {
+            if (memcmp(pre_call_dc, exp_call, sizeof(exp_call)) != 0) {
                 fprintf(stderr,
                         "MPC5200: PRE-PATCH BYTES MISMATCH at 0x001791dc: "
                         "%02x%02x%02x%02x (expect bctrl 4e800421). "
                         "BSP image may have changed — refusing to patch.\n",
-                        pre_call[0], pre_call[1], pre_call[2], pre_call[3]);
+                        pre_call_dc[0], pre_call_dc[1],
+                        pre_call_dc[2], pre_call_dc[3]);
+                fflush(stderr);
+                abort();
+            }
+            if (memcmp(pre_call_a8, exp_call, sizeof(exp_call)) != 0) {
+                fprintf(stderr,
+                        "MPC5200: PRE-PATCH BYTES MISMATCH at 0x001791a8: "
+                        "%02x%02x%02x%02x (expect bctrl 4e800421). "
+                        "BSP image may have changed — refusing to patch.\n",
+                        pre_call_a8[0], pre_call_a8[1],
+                        pre_call_a8[2], pre_call_a8[3]);
                 fflush(stderr);
                 abort();
             }
         }
 
-        /* Patch bctrl -> nop (0x60000000) at 0x001791dc. */
+        /* Patch bctrl -> nop (0x60000000) at both 0x001791a8 and 0x001791dc. */
         static const uint8_t nop_bytes[4] = { 0x60, 0x00, 0x00, 0x00 };
-        cpu_physical_memory_write(guard_call_site, nop_bytes,
+        cpu_physical_memory_write(guard_call_site_a8, nop_bytes,
+                                  sizeof(nop_bytes));
+        cpu_physical_memory_write(guard_call_site_dc, nop_bytes,
                                   sizeof(nop_bytes));
 
         /*
@@ -833,11 +854,13 @@ static void mpc5200_apply_keyswitch_patches(void)
      * the writes landed (catches DRAM-mapping / read-only-region issues
      * that would otherwise be silent). */
     {
-        uint8_t v_site[4], v_stub[16], v_probe[16], v_guard_site[4];
+        uint8_t v_site[4], v_stub[16], v_probe[16];
+        uint8_t v_guard_dc[4], v_guard_a8[4];
         cpu_physical_memory_read(0x001180b8, v_site, sizeof(v_site));
         cpu_physical_memory_read(0x002acef0, v_stub, sizeof(v_stub));
         cpu_physical_memory_read(0x002acf80, v_probe, sizeof(v_probe));
-        cpu_physical_memory_read(0x001791dc, v_guard_site, sizeof(v_guard_site));
+        cpu_physical_memory_read(0x001791dc, v_guard_dc, sizeof(v_guard_dc));
+        cpu_physical_memory_read(0x001791a8, v_guard_a8, sizeof(v_guard_a8));
         fprintf(stderr,
                 "MPC5200: post-patch verify: 0x001180b8 = %02x%02x%02x%02x "
                 "(expect bl 0x002acef0 = 48194e39); "
@@ -847,6 +870,8 @@ static void mpc5200_apply_keyswitch_patches(void)
                 "probe @ 0x002acf80 = %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x "
                 "(expect lis r9,0x07BE = 3d2007be, ori = 6129dd04, "
                 "li r10,8 = 39400008, stw r10,0(r9) = 91490000); "
+                "0x001791a8 = %02x%02x%02x%02x (expect nop = 60000000, "
+                "was bctrl = 4e800421); "
                 "0x001791dc = %02x%02x%02x%02x (expect nop = 60000000, "
                 "was bctrl = 4e800421)\n",
                 v_site[0], v_site[1], v_site[2], v_site[3],
@@ -858,7 +883,8 @@ static void mpc5200_apply_keyswitch_patches(void)
                 v_probe[4], v_probe[5], v_probe[6], v_probe[7],
                 v_probe[8], v_probe[9], v_probe[10], v_probe[11],
                 v_probe[12], v_probe[13], v_probe[14], v_probe[15],
-                v_guard_site[0], v_guard_site[1], v_guard_site[2], v_guard_site[3]);
+                v_guard_a8[0], v_guard_a8[1], v_guard_a8[2], v_guard_a8[3],
+                v_guard_dc[0], v_guard_dc[1], v_guard_dc[2], v_guard_dc[3]);
     }
 
     fprintf(stderr,
@@ -871,8 +897,9 @@ static void mpc5200_apply_keyswitch_patches(void)
             "installed sysClkInt tail-patch @ 0x001180b8 -> stub @ 0x002acef0 "
             "(33-insn extended shim: netjob path -> netJobAdd @ 0x0022c288 + "
             "sem-queue path -> qPriBMapPut @ 0x002cd8e0); "
-            "nopped excExcHandle bctrl @ 0x001791dc (skips all hook-handler "
-            "calls at this site to avoid NULL-fn-ptr crash); "
+            "nopped excExcHandle bctrl @ 0x001791a8 + 0x001791dc (skips all "
+            "hook-handler calls at both indirect-call sites to avoid "
+            "NULL-fn-ptr crashes); "
             "probe stub @ 0x002acf80 (writes 0xCAFEBABE to MMIO 0xF0004038)\n",
             fshook_root());
     fflush(stderr);
