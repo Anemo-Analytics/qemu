@@ -1106,6 +1106,7 @@ static BootStation g_boot_stations[] = {
     { 0x002acef0, 0x002acef3, "VX: sysClkInt tail-patch stub entry",     false, 0 },
     { 0x002acf80, 0x002acf83, "VX: NETJOB-PROBE stub entry (deferred)",   false, 0 },
     { 0x0022c288, 0x0022c28b, "VX: netJobAdd entry (sig-matched)",        false, 0 },
+    { 0x0022c434, 0x0022c437, "VX: netJobAdd return (first blr)",        false, 0 },
     { 0x0022c0fc, 0x0022c0ff, "VX: netTask entry (sig-matched)",          false, 0 },
     { 0x002ff5c4, 0x002ff5c7, "VX: semGive entry (BSP-direct, not shim)", false, 0 },
     { 0x002ff884, 0x002ff887, "VX: semFlush entry (via shim)",           false, 0 },
@@ -1162,6 +1163,13 @@ static unsigned g_nip_hist[NIP_HIST_SIZE];
 #define SEMGIVE_HIST_SIZE ((SEMGIVE_HIST_END - SEMGIVE_HIST_BASE) / 4)
 static unsigned g_semgive_hist[SEMGIVE_HIST_SIZE];
 
+/* netJobAdd body coverage: 0x0022c288..0x0022c440 (108 instructions).
+ * Decisive: any sample landing in this range proves netJobAdd ran. */
+#define NETJOB_HIST_BASE 0x0022c280UL
+#define NETJOB_HIST_END  0x0022c440UL
+#define NETJOB_HIST_SIZE ((NETJOB_HIST_END - NETJOB_HIST_BASE) / 4)
+static unsigned g_netjob_hist[NETJOB_HIST_SIZE];
+
 static void mpc5200_diag_sample(void *opaque)
 {
     MPC5200State *s = opaque;
@@ -1180,6 +1188,26 @@ static void mpc5200_diag_sample(void *opaque)
     if (!patches_applied) {
         mpc5200_apply_keyswitch_patches();
         patches_applied = true;
+
+        /* MMU-PROBE (plan post-Phase-A Test 1): are our QEMU-side
+         * physical-address reads of the netJobAdd state seeing the same
+         * RAM that the CPU's data MMU resolves these VAs to? If
+         * divergent, every "r31 should be non-zero" inference based on
+         * ldl_be_phys(0x980A3C) has been looking at the wrong page. */
+        {
+            CPUState *cs = CPU(s->cpu);
+            hwaddr pa_980A34 = cpu_get_phys_page_debug(cs, 0x00980A34);
+            hwaddr pa_980A3C = cpu_get_phys_page_debug(cs, 0x00980A3C);
+            hwaddr pa_22c288 = cpu_get_phys_page_debug(cs, 0x0022c288);
+            hwaddr pa_2acef0 = cpu_get_phys_page_debug(cs, 0x002acef0);
+            fprintf(stderr,
+                "MMU-PROBE: VA 0x00980A34 -> PA 0x" HWADDR_FMT_plx "\n"
+                "MMU-PROBE: VA 0x00980A3C -> PA 0x" HWADDR_FMT_plx "\n"
+                "MMU-PROBE: VA 0x0022c288 -> PA 0x" HWADDR_FMT_plx "\n"
+                "MMU-PROBE: VA 0x002acef0 -> PA 0x" HWADDR_FMT_plx "\n",
+                pa_980A34, pa_980A3C, pa_22c288, pa_2acef0);
+            fflush(stderr);
+        }
     }
 
     target_ulong nip = s->cpu->env.nip;
@@ -1212,6 +1240,13 @@ static void mpc5200_diag_sample(void *opaque)
         unsigned idx = (nip - SEMGIVE_HIST_BASE) / 4;
         if (g_semgive_hist[idx] < UINT_MAX) {
             g_semgive_hist[idx]++;
+        }
+    }
+    /* netJobAdd body histogram — proves netJobAdd ran if any bucket > 0. */
+    if (nip >= NETJOB_HIST_BASE && nip < NETJOB_HIST_END) {
+        unsigned idx = (nip - NETJOB_HIST_BASE) / 4;
+        if (g_netjob_hist[idx] < UINT_MAX) {
+            g_netjob_hist[idx]++;
         }
     }
 
@@ -1423,6 +1458,26 @@ static void mpc5200_diag_sample(void *opaque)
                 hits++;
             }
             fprintf(stderr, "SEM-HIST: %u distinct PCs sampled\n", hits);
+        }
+        /* NETJOB-HIST end-of-run: every non-zero bucket in netJobAdd body. */
+        {
+            unsigned hits = 0, total = 0;
+            fprintf(stderr,
+                    "NETJOB-HIST-END: netJobAdd body samples "
+                    "(0x%08x..0x%08x):\n",
+                    (unsigned)NETJOB_HIST_BASE,
+                    (unsigned)NETJOB_HIST_END);
+            for (j = 0; j < NETJOB_HIST_SIZE; j++) {
+                if (g_netjob_hist[j] == 0) continue;
+                fprintf(stderr, "NETJOB-HIST-END:   0x%08x : %u\n",
+                        (unsigned)(NETJOB_HIST_BASE + j * 4),
+                        g_netjob_hist[j]);
+                hits++;
+                total += g_netjob_hist[j];
+            }
+            fprintf(stderr,
+                    "NETJOB-HIST-END: %u distinct PCs, %u total samples\n",
+                    hits, total);
         }
         fflush(stderr);
     }
@@ -1914,13 +1969,84 @@ static void mpc5200_tick(void *opaque)
                 tick_count / 60);
         fflush(stderr);
     }
+
+    /*
+     * READYQ-FORCE-NET (Phase B.4 of stage1-tnettask-wedge plan):
+     * Phase A bisect found that the shim's `b netJobAdd` does NOT cause
+     * netJobAdd's success path to run for our doorbell — slot_func at
+     * *(free+4) never changes to our 0x002acf80, free pointer never
+     * advances, the per-call counter at 0x908394 stays 0. So the BSP-route
+     * via shim->netJobAdd->semGive(netTaskSem) is broken for our wake.
+     *
+     * Fix: sidestep the BSP entirely. Mirror READYQ-FORCE-RX pattern for
+     * tNetTask. tNetTask priority = 99 (per TCB-SCAN) so the bitmap bits
+     * are: top_bit = (255-99)/8 = 19, sub_bit = (255-99)%8 = 4.
+     *
+     * Apply on every tick from vt=8s onwards so kernel scheduler can't
+     * undo us. If tNetTask actually dispatches, its TCB-WATCH will show
+     * status flip 0x2 -> 0x0 and PC move off 0x002fe918 (semTake site).
+     * If status flips but PC stays at 0x002fe918, we hit the same kernel-
+     * scheduler-readyQ wall as READYQ-FORCE-RX (Phase D territory).
+     */
+    if (tick_count >= 60 * 8) {
+        AddressSpace *as_force = &address_space_memory;
+        const uint32_t TCB_NETTASK = 0x07fc1f30;
+        const uint32_t READYQ      = 0x0099af58;
+        uint32_t rqbmap = ldl_be_phys(as_force, READYQ + 0x04);
+        stl_be_phys(as_force, READYQ + 0x00, TCB_NETTASK);
+        if (rqbmap) {
+            uint32_t b0 = ldl_be_phys(as_force, rqbmap + 0x00);
+            stl_be_phys(as_force, rqbmap + 0x00, b0 | (1u << 19));
+            uint32_t byte_off = rqbmap + 4 + 19;
+            uint8_t b;
+            cpu_physical_memory_read(byte_off, &b, 1);
+            b |= (1u << 4);
+            cpu_physical_memory_write(byte_off, &b, 1);
+        }
+        stl_be_phys(as_force, TCB_NETTASK + 0x3C, 0);  /* status = READY */
+        static unsigned net_force_log = 0;
+        if (net_force_log++ < 8) {
+            fprintf(stderr,
+                    "READYQ-FORCE-NET: force-wake tNetTask #%u "
+                    "(TCB.status=READY, readyQ.first=0x%08x, "
+                    "bmap[0]|=1<<19, byte[19]|=1<<4)\n",
+                    net_force_log, TCB_NETTASK);
+            fflush(stderr);
+        }
+    }
     if (tick_count >= 60 * 4 && tick_count <= 60 * 20 &&
         (tick_count % 30) == 0) {
+        /* netJobAdd increments BSS counter at 0x908394 every call (see
+         * disasm at 0x22c358..0x22c378). Decisive test: if this is > 0
+         * after the doorbell fires, netJobAdd actually ran and the
+         * 100us sampler just missed the 1-insn entry station. */
+        AddressSpace *as_nj = &address_space_memory;
+        uint32_t njcount = ldl_be_phys(as_nj, 0x908394);
+        /* netJobInfo @ 0x980A34: head=0(r30), tail=4(r30), free=8(r30),
+         * netTaskSem ID=12(r30). If free==0, netJobAdd takes early exit
+         * at bt 2,0x22c388 (skips counter increment). */
+        uint32_t nj_head = ldl_be_phys(as_nj, 0x980A34);
+        uint32_t nj_free = ldl_be_phys(as_nj, 0x980A3C);
+        uint32_t nj_sem  = ldl_be_phys(as_nj, 0x980A40);
+        /* Read free-list head and the slot's func field. If netJobAdd's
+         * success path runs, it stores r29 (= func arg) at *(r31+4) =
+         * *(free+4). So slot_func != 0 proves success path ran. */
+        uint32_t free_next = (nj_free != 0)
+            ? ldl_be_phys(as_nj, nj_free) : 0;
+        uint32_t slot_func = (nj_free != 0)
+            ? ldl_be_phys(as_nj, nj_free + 4) : 0;
+        /* PROBE-MARKER (post-Phase-A plan Test 2): probe stub at 0x002acf80
+         * writes 8 to *(0x07BEDD04) at its +0x10 instruction. If our shim's
+         * `b` at +0x34 actually transfers control when redirected to the
+         * probe stub, this byte flips to 0x00000008. */
+        uint32_t fec_flag = ldl_be_phys(as_nj, 0x07BEDD04);
         fprintf(stderr,
-                "NETJOB-WATCH: t=%d.%02ds netjob_func=0x%08x "
-                "netjob_probe=0x%08x\n",
+                "NETJOB-WATCH: t=%d.%02ds netjob_func=0x%08x njcount=%u "
+                "head=0x%08x free=0x%08x *(free)=0x%08x slot_func=0x%08x "
+                "sem=0x%08x PROBE-MARKER=0x%08x\n",
                 tick_count / 60, (tick_count % 60) * 100 / 60,
-                s->fshook.netjob_func, s->fshook.netjob_probe);
+                s->fshook.netjob_func, njcount,
+                nj_head, nj_free, free_next, slot_func, nj_sem, fec_flag);
         fflush(stderr);
     }
     if (tick_count >= 60 * 8 && tick_count <= 60 * 14 && (tick_count % 60) == 0) {
@@ -2154,6 +2280,23 @@ static void mpc5200_tick(void *opaque)
             hits++;
         }
         fprintf(stderr, "SEM-HIST: %u distinct PCs sampled\n", hits);
+
+        unsigned nj_hits = 0, nj_total = 0;
+        fprintf(stderr,
+                "NETJOB-HIST: netJobAdd body samples "
+                "(0x%08x..0x%08x) at vt=15s:\n",
+                (unsigned)NETJOB_HIST_BASE, (unsigned)NETJOB_HIST_END);
+        for (unsigned j = 0; j < NETJOB_HIST_SIZE; j++) {
+            if (g_netjob_hist[j] == 0) continue;
+            fprintf(stderr, "NETJOB-HIST:   0x%08x : %u\n",
+                    (unsigned)(NETJOB_HIST_BASE + j * 4),
+                    g_netjob_hist[j]);
+            nj_hits++;
+            nj_total += g_netjob_hist[j];
+        }
+        fprintf(stderr,
+                "NETJOB-HIST: %u distinct PCs sampled, %u total samples\n",
+                nj_hits, nj_total);
         fflush(stderr);
     }
 
