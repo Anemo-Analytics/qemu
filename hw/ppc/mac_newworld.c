@@ -1140,6 +1140,22 @@ static BootStation g_boot_stations[] = {
      * created — stronger signal than just usrToolsInit. */
     { 0x00177b34, 0x00177b37, "VX: tRootTask post-wake (after wedge)",   false, 0 },
     { 0x0017de2c, 0x0017de2f, "VX: ftpdTask-created printf (in ftpdInit)", false, 0 },
+
+    /* === Layer-3 wedge: post-walker FEC RX chain stations (plan
+     * 2026-05-14 Test 2). After Test 1 confirmed sem 0x07bee080 NEVER
+     * gets a semGive post-boot, we need to know how far the handler
+     * gets. If 0x12e864 (success-path return) hits but no semGive
+     * happens, the wake-issuing call is missing entirely (F3).
+     * If 0x12e87c (deferred callback) hits, deferred work runs.
+     * 0x142d90 is the job-scheduler called from both handler and
+     * callback; 0x12a6fc is a helper called from both. */
+    { 0x0012e7fc, 0x0012e7ff, "VX: FEC RX handler post-walker return",      false, 0 },
+    { 0x0012e81c, 0x0012e81f, "VX: FEC RX handler bl 0x142d90 call site",   false, 0 },
+    { 0x0012e864, 0x0012e867, "VX: FEC RX handler success-path return",     false, 0 },
+    { 0x0012e87c, 0x0012e87f, "VX: FEC RX deferred callback entry",         false, 0 },
+    { 0x0012e8b8, 0x0012e8bb, "VX: FEC RX deferred callback re-walker call", false, 0 },
+    { 0x00142d90, 0x00142d93, "VX: job-scheduler entry (target of bl 0x142d90)", false, 0 },
+    { 0x0012a6fc, 0x0012a6ff, "VX: helper called from FEC RX handler+callback", false, 0 },
 };
 
 /* NIP histogram across full bootrom .text — reveals idle loops. */
@@ -1361,37 +1377,40 @@ static void mpc5200_diag_sample(void *opaque)
     }
 
     /*
-     * tFecEndRx_sem watcher (plan 2026-05-13, Test 2c): raw 32-byte dump
-     * of the sem-block at 0x07bee080 every ~1 s. If `semGive(tFecEndRx)`
-     * ever fires, the count/queue fields (typically near the head) will
-     * change. If they NEVER change despite the SDMA mux-ISR W1C-acking
-     * bit 3 (FEC RX) IRQs, that is decisive evidence that the bit-3
-     * handler is not being dispatched (H1 / H2).
+     * tFecEndRx_sem watcher (plan 2026-05-13, Test 2c; tightened
+     * 2026-05-14 Layer-3 plan Test 1): raw 32-byte dump of the sem-block
+     * at 0x07bee080 every diag tick (100 us). Output volume is bounded by
+     * the change-only filter — only writes produce log lines. On change,
+     * also log NIP/LR/MSR.EE so we can identify the writer:
+     *   - NIP in semGive body (0x002ff5c4..0x002ff800) => F1 (sem-give
+     *     reaches the right sem; wake-the-task step is broken).
+     *   - NIP elsewhere => unexpected writer (investigate).
+     *   - No changes for the full run => F2/F3 (sem-give either targets
+     *     a different sem or never runs in the FEC RX chain).
      */
     {
-        static int sem_tick = 0;
         static uint32_t last_w0, last_w1, last_w2, last_w3;
         static bool sem_first = true;
-        if (++sem_tick >= 10000) { /* 10000 × 100us = 1 s */
-            sem_tick = 0;
-            uint32_t w0 = ldl_be_phys(&address_space_memory, 0x07bee080);
-            uint32_t w1 = ldl_be_phys(&address_space_memory, 0x07bee084);
-            uint32_t w2 = ldl_be_phys(&address_space_memory, 0x07bee088);
-            uint32_t w3 = ldl_be_phys(&address_space_memory, 0x07bee08c);
-            bool changed = sem_first ||
-                           (w0 != last_w0) || (w1 != last_w1) ||
-                           (w2 != last_w2) || (w3 != last_w3);
-            if (changed) {
-                fprintf(stderr,
-                        "FECRX-SEM @ 0x07bee080: %08x %08x %08x %08x  "
-                        "(t=%ds %s)\n",
-                        w0, w1, w2, w3,
-                        diag_count / 10000,
-                        sem_first ? "init" : "CHANGED");
-                fflush(stderr);
-                sem_first = false;
-                last_w0 = w0; last_w1 = w1; last_w2 = w2; last_w3 = w3;
-            }
+        uint32_t w0 = ldl_be_phys(&address_space_memory, 0x07bee080);
+        uint32_t w1 = ldl_be_phys(&address_space_memory, 0x07bee084);
+        uint32_t w2 = ldl_be_phys(&address_space_memory, 0x07bee088);
+        uint32_t w3 = ldl_be_phys(&address_space_memory, 0x07bee08c);
+        bool changed = sem_first ||
+                       (w0 != last_w0) || (w1 != last_w1) ||
+                       (w2 != last_w2) || (w3 != last_w3);
+        if (changed) {
+            target_ulong lr_now = s->cpu->env.lr;
+            fprintf(stderr,
+                    "FECRX-SEM @ 0x07bee080: %08x %08x %08x %08x  "
+                    "(t=%ds %s NIP=0x%08x LR=0x%08x MSR.EE=%d)\n",
+                    w0, w1, w2, w3,
+                    diag_count / 10000,
+                    sem_first ? "init" : "CHANGED",
+                    (unsigned)nip, (unsigned)lr_now,
+                    (msr & (1u << 15)) ? 1 : 0);
+            fflush(stderr);
+            sem_first = false;
+            last_w0 = w0; last_w1 = w1; last_w2 = w2; last_w3 = w3;
         }
     }
 

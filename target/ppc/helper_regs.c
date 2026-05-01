@@ -361,6 +361,22 @@ int hreg_store_msr(CPUPPCState *env, target_ulong value, int alter_hv)
                 fflush(stderr);
             }
         }
+        /* Layer-3 plan #1 (2026-05-14): track MSR.ILE transitions. ILE=1
+         * makes exception delivery flip to LE mode; on a BE BSP this
+         * crashes the vector to NIP=0x90c HV_EMU. Need to find who sets
+         * ILE in env->msr. */
+        static unsigned ile_log_count;
+        if (((last_msr ^ value) & (1ULL << MSR_ILE)) && ile_log_count++ < 64) {
+            fprintf(stderr,
+                "MSR.ILE %d -> %d  nip=0x%08x lr=0x%08x msr_old=0x%08x "
+                "msr_new=0x%08x [%u]\n",
+                (int)((last_msr >> MSR_ILE) & 1),
+                (int)((value    >> MSR_ILE) & 1),
+                (uint32_t)env->nip, (uint32_t)env->lr,
+                (uint32_t)last_msr, (uint32_t)value,
+                ile_log_count);
+            fflush(stderr);
+        }
         last_msr = value;
     }
 #endif
