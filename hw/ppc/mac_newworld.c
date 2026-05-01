@@ -931,6 +931,86 @@ static void mpc5200_apply_keyswitch_patches(void)
                 v_guard_dc[0], v_guard_dc[1], v_guard_dc[2], v_guard_dc[3]);
     }
 
+    /*
+     * Layer-6 fix (2026-05-14): patch `muxDevStopAll` (= vxworks.out
+     * 0x0023de1c, found via symbol table at file 0x7f9920) to return
+     * success immediately. This is what's calling the FEC teardown
+     * helper at vt~11.87s via END_FUNCS slot 1 (unload). Disabling it
+     * prevents the unintended FEC unload during normal operation.
+     *
+     * `muxDevStopAll` is typically called only during system shutdown.
+     * On QEMU the BSP shouldn't be entering shutdown — yet at vt~12s
+     * something invokes it. Until we identify the trigger, just patch
+     * the entry to `li r3, 0; blr`.
+     *
+     * Pre-flight verification: 0x0023de1c should currently be the
+     * function prologue `stwu 1, -16(1)` = 0x9421fff0.
+     */
+    {
+        const uint32_t mux_stop_addr = 0x0023de1c;
+        uint8_t pre[4];
+        cpu_physical_memory_read(mux_stop_addr, pre, 4);
+        static const uint8_t exp[4] = { 0x94, 0x21, 0xff, 0xf0 };
+        if (memcmp(pre, exp, 4) != 0) {
+            fprintf(stderr,
+                "MPC5200: PRE-PATCH BYTES MISMATCH at 0x0023de1c "
+                "(muxDevStopAll): %02x%02x%02x%02x "
+                "(expect stwu 1,-16(1) = 9421fff0). Refusing to patch.\n",
+                pre[0], pre[1], pre[2], pre[3]);
+            fflush(stderr);
+            abort();
+        }
+        /* `li r3, 0; blr` = 0x38600000 0x4e800020 */
+        static const uint8_t patch_bytes[8] = {
+            0x38, 0x60, 0x00, 0x00,   /* li r3, 0       */
+            0x4e, 0x80, 0x00, 0x20,   /* blr            */
+        };
+        cpu_physical_memory_write(mux_stop_addr, patch_bytes, 8);
+    }
+
+    /*
+     * Layer-6 fix (2026-05-14): nop the two semDelete calls inside the
+     * FEC teardown helper at 0x0012b8b4.
+     *
+     * The teardown's destructive bits are the two `bl 0x002ff9f4`
+     * (semDelete) calls at 0x0012ba7c (sem at FEC+1248 = tFecRx_sem)
+     * and 0x0012ba90 (sem at FEC+1252 = tFecTx_sem). On QEMU's emulated
+     * FEC the link doesn't actually go down, so this BSP-side recovery
+     * is unnecessary; preventing the deletes keeps tFecEndRx alive.
+     *
+     * Replacing the WHOLE teardown with `blr` is too aggressive — the
+     * outer context (BestComm task disable, FEC ECNTRL reset, etc.)
+     * still needs to run for the caller's bookkeeping. Just skip the
+     * sem-delete primitives.
+     *
+     * Pre-flight verification:
+     *   0x0012ba7c should be `bl 0x2ff9f4` = 0x481d3f79
+     *   0x0012ba90 should be `bl 0x2ff9f4` = 0x481d3f65
+     */
+    {
+        struct { uint32_t addr; uint32_t expect; const char *what; } sd[] = {
+            { 0x0012ba7c, 0x481d3f79, "bl semDelete (sem1=tFecRx_sem)" },
+            { 0x0012ba90, 0x481d3f65, "bl semDelete (sem2=tFecTx_sem)" },
+        };
+        for (int i = 0; i < (int)ARRAY_SIZE(sd); i++) {
+            uint8_t pre[4];
+            cpu_physical_memory_read(sd[i].addr, pre, 4);
+            uint32_t got = ((uint32_t)pre[0] << 24) | ((uint32_t)pre[1] << 16)
+                         | ((uint32_t)pre[2] << 8)  | (uint32_t)pre[3];
+            if (got != sd[i].expect) {
+                fprintf(stderr,
+                    "MPC5200: PRE-PATCH BYTES MISMATCH at 0x%08x: "
+                    "%08x (expect %08x = %s). Refusing to patch.\n",
+                    sd[i].addr, got, sd[i].expect, sd[i].what);
+                fflush(stderr);
+                abort();
+            }
+            /* nop = 0x60000000 */
+            static const uint8_t nop_bytes[4] = { 0x60, 0x00, 0x00, 0x00 };
+            cpu_physical_memory_write(sd[i].addr, nop_bytes, 4);
+        }
+    }
+
     fprintf(stderr,
             "MPC5200: applied CT296 KeySwitch bypass patches at 0x12d390, "
             "0x12ae60; force-zeroed app-spawn gate at 0x00962e2c; "
@@ -1151,6 +1231,11 @@ static BootStation g_boot_stations[] = {
     { 0x0012da98, 0x0012da9b, "VX: FEC ioctl(?) caller of teardown",      false, 0 },
     { 0x0012de58, 0x0012de5b, "VX: FEC unload(?) caller of teardown",     false, 0 },
     { 0x0012d850, 0x0012d853, "VX: FEC ioctl/stop function entry",        false, 0 },
+    { 0x0012cd0c, 0x0012cd0f, "VX: tFecEndRecover entry",                  false, 0 },
+    { 0x0012cdd0, 0x0012cdd3, "VX: tFecEndRecover state==8 recovery branch", false, 0 },
+    { 0x0012d06c, 0x0012d06f, "VX: FEC state=7 setter (in stop fn)",      false, 0 },
+    { 0x0012d5b8, 0x0012d5bb, "VX: FEC state=8 setter (in start fn, was 7)", false, 0 },
+    { 0x002ff9f4, 0x002ff9f7, "VX: semDelete entry",                       false, 0 },
 
     /* === Layer-3 wedge: post-walker FEC RX chain stations (plan
      * 2026-05-14 Test 2). After Test 1 confirmed sem 0x07bee080 NEVER
@@ -1460,6 +1545,26 @@ static void mpc5200_diag_sample(void *opaque)
                 vec_stable_count = 0;
             } else if (!any_change) {
                 vec_stable_count++;
+            }
+        }
+    }
+
+    /*
+     * Layer-6 plan (2026-05-14): semDelete sniffer. Log every call to
+     * semDelete (0x002ff9f4) with the sem ID it's deleting, NIP, LR.
+     * Decisive: which task / call-chain destroys tFecRx_sem?
+     */
+    {
+        if (nip == 0x002ff9f4) {
+            static unsigned semd_count;
+            if (semd_count++ < 64) {
+                target_ulong r3 = s->cpu->env.gpr[3];
+                fprintf(stderr,
+                    "SEM-DEL: arg.r3=0x%08x NIP=0x%08x LR=0x%08x t=%d.%02ds [%u]\n",
+                    (unsigned)r3, (unsigned)nip, (unsigned)s->cpu->env.lr,
+                    diag_count / 10000, (diag_count % 10000) / 100,
+                    semd_count);
+                fflush(stderr);
             }
         }
     }
