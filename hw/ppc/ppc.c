@@ -57,6 +57,24 @@ void ppc_set_irq(PowerPCCPU *cpu, int irq, int level)
         env->pending_interrupts &= ~irq;
     }
 
+    /* Layer-7 plan (2026-05-14): tap EXT bit TRANSITIONS only — when
+     * old_pi.EXT differs from new_pi.EXT. */
+    {
+        if (irq == 0x8 /* PPC_INTERRUPT_EXT */ &&
+            ((old_pending ^ env->pending_interrupts) & 0x8)) {
+            int64_t ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+            static unsigned ext_xn;
+            if (ext_xn++ < 64) {
+                fprintf(stderr,
+                    "PPC-EXT-XN: lvl=%d old_pi=0x%08x new_pi=0x%08x "
+                    "vt_ns=%lld [%u]\n",
+                    level, old_pending, (unsigned)env->pending_interrupts,
+                    (long long)ns, ext_xn);
+                fflush(stderr);
+            }
+        }
+    }
+
     if (old_pending != env->pending_interrupts) {
         ppc_maybe_interrupt(env);
         if (kvm_enabled()) {

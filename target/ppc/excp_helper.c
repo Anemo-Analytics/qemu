@@ -2108,7 +2108,34 @@ void ppc_maybe_interrupt(CPUPPCState *env)
     CPUState *cs = env_cpu(env);
     BQL_LOCK_GUARD();
 
-    if (ppc_next_unmasked_interrupt(env)) {
+    int next = ppc_next_unmasked_interrupt(env);
+    /* Layer-7 plan (2026-05-14): tap interrupt-delivery decision. Log
+     * EVERY EXT-pending maybe_interrupt call, but bucket by virtual
+     * time so we can see post-curl events too. */
+    {
+        static unsigned boot_mi, late_mi;
+        if (env->pending_interrupts & PPC_INTERRUPT_EXT) {
+            int64_t ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+            bool log_it = false;
+            if (ns < 1000000000LL) {
+                /* boot phase: cap at 16 */
+                log_it = boot_mi++ < 16;
+            } else {
+                /* post-boot: cap at 64 */
+                log_it = late_mi++ < 64;
+            }
+            if (log_it) {
+                fprintf(stderr,
+                    "MAYBE-INT: pi=0x%08x msr=0x%08x next=0x%x ireq=0x%x "
+                    "vt_ns=%lld [b%u/l%u]\n",
+                    (unsigned)env->pending_interrupts, (unsigned)env->msr,
+                    next, (unsigned)cs->interrupt_request,
+                    (long long)ns, boot_mi, late_mi);
+                fflush(stderr);
+            }
+        }
+    }
+    if (next) {
         cpu_interrupt(cs, CPU_INTERRUPT_HARD);
     } else {
         cpu_reset_interrupt(cs, CPU_INTERRUPT_HARD);
@@ -2493,6 +2520,22 @@ bool ppc_cpu_exec_interrupt(CPUState *cs, int interrupt_request)
     CPUPPCState *env = cpu_env(cs);
     int interrupt;
 
+    /* Layer-7 plan (2026-05-14): tap exec_interrupt entry whenever EXT
+     * is in pending. No vt gate — we want every call after curl-SYN. */
+    {
+        static unsigned exec_call;
+        if ((env->pending_interrupts & PPC_INTERRUPT_EXT) && exec_call++ < 100) {
+            int64_t ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+            fprintf(stderr,
+                "EXEC-EXT: pi=0x%08x msr=0x%08x ireq=0x%x nip=0x%08x "
+                "vt_ns=%lld [%u]\n",
+                (unsigned)env->pending_interrupts, (unsigned)env->msr,
+                (unsigned)interrupt_request, (unsigned)env->nip,
+                (long long)ns, exec_call);
+            fflush(stderr);
+        }
+    }
+
     if ((interrupt_request & CPU_INTERRUPT_HARD) == 0) {
         return false;
     }
@@ -2500,6 +2543,19 @@ bool ppc_cpu_exec_interrupt(CPUState *cs, int interrupt_request)
     interrupt = ppc_next_unmasked_interrupt(env);
     if (interrupt == 0) {
         return false;
+    }
+
+    /* Layer-7 plan (2026-05-14): tap EXT exception delivery. */
+    if (interrupt & PPC_INTERRUPT_EXT) {
+        static unsigned ext_dlv;
+        if (ext_dlv++ < 32) {
+            int64_t ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+            fprintf(stderr,
+                "EXT-DLV: pi=0x%08x msr=0x%08x nip=0x%08x vt_ns=%lld [%u]\n",
+                (unsigned)env->pending_interrupts, (unsigned)env->msr,
+                (unsigned)env->nip, (long long)ns, ext_dlv);
+            fflush(stderr);
+        }
     }
 
     ppc_deliver_interrupt(env, interrupt);

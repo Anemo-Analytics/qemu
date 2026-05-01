@@ -1703,6 +1703,18 @@ static void mpc5200_tick(void *opaque)
     /* Patches now applied from mpc5200_diag_sample (fires at 1us, much
      * earlier than this 60Hz tick which is delayed 1s by design). */
 
+    /* Layer-7 plan: prove tick is alive every second post-vt=10s. */
+    if (tick_count > 60 * 10 && (tick_count % 60) == 0) {
+        CPUPPCState *env = &s->cpu->env;
+        CPUState *cs = CPU(s->cpu);
+        fprintf(stderr,
+            "TICK-ALIVE: t=%ds pi=0x%08x msr=0x%08x ireq=0x%x nip=0x%08x\n",
+            tick_count / 60,
+            (uint32_t)env->pending_interrupts, (uint32_t)env->msr,
+            (uint32_t)cs->interrupt_request, (uint32_t)env->nip);
+        fflush(stderr);
+    }
+
     /*
      * EE-FORCE (2026-04-30): the BSP scheduler enters its critical section
      * (`0x00207f6c` clears EE), scans the ready queue, finds nothing, and
@@ -1745,6 +1757,51 @@ static void mpc5200_tick(void *opaque)
                         forces, tick_count / 60,
                         (tick_count % 60) * 100 / 60,
                         (uint32_t)env->nip, (uint32_t)env->msr);
+                fflush(stderr);
+            }
+        }
+    }
+
+    /*
+     * Layer-7 plan (2026-05-14): EXT-FORCE. After Layer-6 fix, the
+     * BSP's natural FEC RX dispatch chain raises EXT but TCG never
+     * delivers (kernel stuck in CpuloadLow's mftb tight loop with
+     * MSR=0x9000 EE=1, but exec_interrupt is never called with
+     * pi.EXT set). Force EXT delivery analogously to EE-FORCE.
+     *
+     * If EXT has been pending for ≥ 2 ticks (≥33 ms) AND
+     * env->cs->interrupt_request HARD bit is clear (= TCG cleared it
+     * because it didn't see EXT delivered), kick the CPU again with
+     * cpu_interrupt(HARD).
+     */
+    if (tick_count >= 60 * 12) {
+        CPUPPCState *env = &s->cpu->env;
+        CPUState *cs = CPU(s->cpu);
+        bool ext_pending = (env->pending_interrupts & PPC_INTERRUPT_EXT) != 0;
+        bool ee = (env->msr & (1u << 15)) != 0;
+        static unsigned ext_streak;
+        static unsigned ext_forces;
+        if (ext_pending) {
+            ext_streak++;
+        } else {
+            ext_streak = 0;
+        }
+        if (ext_streak >= 2 && ext_forces < 200) {
+            if (!ee) {
+                env->msr |= (1u << 15); /* force EE=1 */
+            }
+            ppc_maybe_interrupt(env);
+            cpu_interrupt(cs, 0x2 /* CPU_INTERRUPT_HARD */);
+            ext_forces++;
+            if (ext_forces <= 8 || (ext_forces % 20) == 0) {
+                fprintf(stderr,
+                        "EXT-FORCE #%u: t=%d.%02ds nip=0x%08x msr=0x%08x "
+                        "pi=0x%08x ireq=0x%x\n",
+                        ext_forces, tick_count / 60,
+                        (tick_count % 60) * 100 / 60,
+                        (uint32_t)env->nip, (uint32_t)env->msr,
+                        (uint32_t)env->pending_interrupts,
+                        (uint32_t)cs->interrupt_request);
                 fflush(stderr);
             }
         }
