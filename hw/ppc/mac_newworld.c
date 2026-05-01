@@ -1266,6 +1266,81 @@ static void mpc5200_diag_sample(void *opaque)
         }
     }
 
+    /*
+     * Layer-5 plan (2026-05-14): periodic readyQ + scheduler-state
+     * dump. After Layer-3+4 fixes, the kernel is alive but stuck in a
+     * tight loop at 0x2fdfcc..0x2fdff8 (intUnlock + readyQ.first check).
+     * That loop is the kernel's "wait for task" busy-wait —
+     * `if (*(0x0099AF58) == 0) { intUnlock(); intLock(); recheck; }`.
+     * Dump readyQ.first + the bmap state to see if the readyQ is
+     * actually empty (== loop is correct) or corrupted.
+     */
+    {
+        static int last_rq_dump_s = -1;
+        int now_rq_s = diag_count / 10000;
+        if (now_rq_s != last_rq_dump_s &&
+            (now_rq_s == 8 || now_rq_s == 14 || now_rq_s == 16 ||
+             now_rq_s == 18 || now_rq_s == 22)) {
+            last_rq_dump_s = now_rq_s;
+            AddressSpace *as_rq = &address_space_memory;
+            uint32_t rq_first = ldl_be_phys(as_rq, 0x0099AF58);
+            uint32_t rq_bmap_pa = ldl_be_phys(as_rq, 0x0099AF58 + 4);
+            uint32_t bmap0 = rq_bmap_pa ?
+                ldl_be_phys(as_rq, rq_bmap_pa) : 0;
+            uint8_t byte28 = 0;
+            if (rq_bmap_pa) {
+                cpu_physical_memory_read(rq_bmap_pa + 4 + 28, &byte28, 1);
+            }
+            uint32_t kstate = ldl_be_phys(as_rq, 0x008d5c60);
+            uint32_t taskCur = ldl_be_phys(as_rq, 0x008CB0A8);
+            fprintf(stderr,
+                "RQ-WATCH t=%ds: readyQ.first=0x%08x bmap_pa=0x%08x "
+                "bmap0=0x%08x byte28=0x%02x kernelState=0x%x "
+                "taskIdCurrent=0x%08x\n",
+                now_rq_s, rq_first, rq_bmap_pa, bmap0, byte28,
+                kstate, taskCur);
+            fflush(stderr);
+        }
+    }
+
+    /*
+     * Layer-5 plan (2026-05-14): coarse "what is the CPU running?"
+     * counter. After Layer-3+4 fixes, kernel runs cleanly and semGive on
+     * tFecEndRx_sem fires, but tFecEndRx stays at saved PC=0x00174fc4
+     * with no SYN+ACK. Need to know: is tFecEndRx actually being
+     * dispatched? Or is the CPU stuck somewhere else?
+     *   tfecrx[0] = tFecEndRx body         (0x0012e000..0x0012f000)
+     *   tfecrx[1] = semOps (semGive/Take)  (0x002fd000..0x00301000)
+     *   tfecrx[2] = idle loop              (0x00207f00..0x00208100)
+     *   tfecrx[3] = sysClkInt              (0x00117e00..0x00118200)
+     *   tfecrx[4] = intUnlock isync stuck  (0x00138a8c..0x00138a90)
+     *   tfecrx[5] = scheduler kernel funcs (0x00174000..0x00179000)
+     *   tfecrx[6] = netTask / IP stack     (0x0022c000..0x0023e000)
+     */
+    {
+        static uint32_t tfecrx[8];
+        if (nip >= 0x0012e000 && nip < 0x0012f000) tfecrx[0]++;
+        else if (nip >= 0x002fd000 && nip < 0x00301000) tfecrx[1]++;
+        else if (nip >= 0x00207f00 && nip < 0x00208100) tfecrx[2]++;
+        else if (nip >= 0x00117e00 && nip < 0x00118200) tfecrx[3]++;
+        else if (nip >= 0x00138a8c && nip < 0x00138a94) tfecrx[4]++;
+        else if (nip >= 0x00174000 && nip < 0x00179000) tfecrx[5]++;
+        else if (nip >= 0x0022c000 && nip < 0x0023e000) tfecrx[6]++;
+        else tfecrx[7]++;
+        static int last_dump_s = -1;
+        int now_s = diag_count / 10000;
+        if (now_s != last_dump_s && (now_s == 16 || now_s == 20 || now_s == 25)) {
+            last_dump_s = now_s;
+            fprintf(stderr,
+                "RUN-WHERE: t=%ds tfec=%u semOps=%u idle=%u sysClk=%u "
+                "intUnlk=%u sched=%u netTask=%u other=%u\n",
+                now_s,
+                tfecrx[0], tfecrx[1], tfecrx[2], tfecrx[3],
+                tfecrx[4], tfecrx[5], tfecrx[6], tfecrx[7]);
+            fflush(stderr);
+        }
+    }
+
     /* Re-apply MBAR SPR if it got cleared by CPU reset. */
     if (s->cpu->env.spr[SPR_MBAR] != 0xF0000000) {
         s->cpu->env.spr[SPR_MBAR] = 0xF0000000;
@@ -1812,11 +1887,16 @@ static void mpc5200_tick(void *opaque)
      * is NOT running.
      */
     /*
-     * SYNTH-DOORBELL (kept). The shim's qPriBMapPut path force-readies
-     * tFecEndRx. Combined with netjob arming below, both paths run on
-     * sequential sysClkInt ticks (netjob first, sem-queue second).
+     * SYNTH-DOORBELL DISABLED (Layer-5, 2026-05-14):
+     * Was: write sem_queue = 0x07bee080 at vt=8s to force-wake
+     * tFecEndRx via the shim's qPriBMapPut path. With the MSR.ILE bug
+     * fixed and the readyQ-force hacks removed, the natural BSP path
+     * takes over: m5200Fec brings up the link, semGives the FEC RX sem
+     * (observed at vt=14s NIP=0x12ba94 from BSP code), and tFecEndRx
+     * runs on its own. The synthetic doorbell here was racing the
+     * natural path and may be triggering a premature FEC restart.
      */
-    if (tick_count == 60 * 8) {
+    if (0 && tick_count == 60 * 8) {
         fprintf(stderr,
                 "SYNTH-DOORBELL: writing s->fshook.sem_queue = 0x07bee080 at "
                 "t=8s — expect tFecEndRx wake by t=9s\n");
@@ -1850,11 +1930,18 @@ static void mpc5200_tick(void *opaque)
      * Guarded with `sem_queue == 0` so we don't clobber the FEC RX post
      * at vt=8s. Each post is consumed within ~17ms (one sysClkInt tick).
      */
-    if ((tick_count == 60 * 5 || tick_count == 60 * 10 ||
-         tick_count == 60 * 12 || tick_count == 60 * 15 ||
-         tick_count == 60 * 20 || tick_count == 60 * 25 ||
-         tick_count == 60 * 30 || tick_count == 60 * 35) &&
-        s->fshook.sem_queue == 0) {
+    /* Layer-4 plan (2026-05-14): fire ROOTTASK-DOORBELL only ONCE.
+     *
+     * Repeated firings after the first cause a different wedge: after
+     * the initial wake at vt=5s tRootTask eventually crashes and gets
+     * suspended (status=0x8) with corrupted TCB.PC=0. The next
+     * doorbell-driven shim path writes TCB.status=0 (force READY) on a
+     * suspended task with a NULL saved PC, the scheduler dispatches it,
+     * context-switch loads PC=0, kernel jumps to NIP=0, HV_EMU loop.
+     *
+     * Single-shot: only fire if we have not fired before.
+     */
+    if (tick_count == 60 * 5 && s->fshook.sem_queue == 0) {
         fprintf(stderr,
                 "ROOTTASK-DOORBELL: writing s->fshook.sem_queue = 0x07bee378 "
                 "at vt=%ds — wake tRootTask from PEND inside usrAppInit chain\n",
@@ -1990,49 +2077,15 @@ static void mpc5200_tick(void *opaque)
     }
 
     /*
-     * READYQ-FORCE-NET (Phase B.4 of stage1-tnettask-wedge plan):
-     * Phase A bisect found that the shim's `b netJobAdd` does NOT cause
-     * netJobAdd's success path to run for our doorbell — slot_func at
-     * *(free+4) never changes to our 0x002acf80, free pointer never
-     * advances, the per-call counter at 0x908394 stays 0. So the BSP-route
-     * via shim->netJobAdd->semGive(netTaskSem) is broken for our wake.
-     *
-     * Fix: sidestep the BSP entirely. Mirror READYQ-FORCE-RX pattern for
-     * tNetTask. tNetTask priority = 99 (per TCB-SCAN) so the bitmap bits
-     * are: top_bit = (255-99)/8 = 19, sub_bit = (255-99)%8 = 4.
-     *
-     * Apply on every tick from vt=8s onwards so kernel scheduler can't
-     * undo us. If tNetTask actually dispatches, its TCB-WATCH will show
-     * status flip 0x2 -> 0x0 and PC move off 0x002fe918 (semTake site).
-     * If status flips but PC stays at 0x002fe918, we hit the same kernel-
-     * scheduler-readyQ wall as READYQ-FORCE-RX (Phase D territory).
+     * READYQ-FORCE-NET REMOVED (Layer-5, 2026-05-14):
+     * Same root cause as READYQ-FORCE-RX — once the MSR.ILE bug was
+     * fixed, the BSP's natural semGive→qPriBMapPut wakes are reaching
+     * the scheduler. This force-wake was racing the kernel state
+     * machine and writing readyQ.first to the wrong task. After
+     * removal, RQ-WATCH at vt=14s shows readyQ.first=tNetTask
+     * (0x07fc1f30) cleanly and bmap[0] bit 19 set as expected — the
+     * BSP got there on its own.
      */
-    if (tick_count >= 60 * 8) {
-        AddressSpace *as_force = &address_space_memory;
-        const uint32_t TCB_NETTASK = 0x07fc1f30;
-        const uint32_t READYQ      = 0x0099af58;
-        uint32_t rqbmap = ldl_be_phys(as_force, READYQ + 0x04);
-        stl_be_phys(as_force, READYQ + 0x00, TCB_NETTASK);
-        if (rqbmap) {
-            uint32_t b0 = ldl_be_phys(as_force, rqbmap + 0x00);
-            stl_be_phys(as_force, rqbmap + 0x00, b0 | (1u << 19));
-            uint32_t byte_off = rqbmap + 4 + 19;
-            uint8_t b;
-            cpu_physical_memory_read(byte_off, &b, 1);
-            b |= (1u << 4);
-            cpu_physical_memory_write(byte_off, &b, 1);
-        }
-        stl_be_phys(as_force, TCB_NETTASK + 0x3C, 0);  /* status = READY */
-        static unsigned net_force_log = 0;
-        if (net_force_log++ < 8) {
-            fprintf(stderr,
-                    "READYQ-FORCE-NET: force-wake tNetTask #%u "
-                    "(TCB.status=READY, readyQ.first=0x%08x, "
-                    "bmap[0]|=1<<19, byte[19]|=1<<4)\n",
-                    net_force_log, TCB_NETTASK);
-            fflush(stderr);
-        }
-    }
     if (tick_count >= 60 * 4 && tick_count <= 60 * 20 &&
         (tick_count % 30) == 0) {
         /* netJobAdd increments BSS counter at 0x908394 every call (see
@@ -2131,32 +2184,14 @@ static void mpc5200_tick(void *opaque)
                 head_key, bmap_w0, bmap_w1);
 
         /*
-         * READYQ-FORCE (plan 2026-04-29 escalation): the BSP-side qPriBMapPut
-         * call from the shim correctly writes TCB+0x08 = key (= 0x1D = 29),
-         * but readyQ.first stays at CpuloadLow's TCB and bmap[0] stays at
-         * 0x01 (only CpuloadLow's bit). Either qPriBMapPut got called with
-         * wrong args, or its writes got rolled back by a context switch
-         * before our probe. Force the issue by directly writing readyQ.first
-         * = our TCB and setting bit 28 in bmap[0] (= prio 29 group).
-         *
-         * This is option (b) of the plan ("splice manually as a one-shot").
+         * READYQ-FORCE REMOVED (Layer-5, 2026-05-14): same reasoning as
+         * the rx_hook hack — with the MSR.ILE bug fixed, the BSP's
+         * natural qPriBMapPut works. Direct writes to readyQ.first
+         * raced the kernel state machine and left the queue
+         * inconsistent. (void)pre_bmap0 just to keep the local alive
+         * for any future trace.
          */
-        uint32_t pre_bmap0 = bmap_w0;
-        stl_be_phys(as, READYQ + 0x00, TCB);
-        if (rqbmap) {
-            stl_be_phys(as, rqbmap + 0x00, pre_bmap0 | (1u << 28));
-            /* Also set the within-group byte. For prio 29: byte index =
-             * (255-29)/8 = 28; bit within byte = (255-29)&7 = 2. */
-            uint32_t byte_off = rqbmap + 4 + 28;
-            uint8_t b;
-            cpu_physical_memory_read(byte_off, &b, 1);
-            b |= (1u << 2);
-            cpu_physical_memory_write(byte_off, &b, 1);
-        }
-        fprintf(stderr,
-                "READYQ-FORCE: wrote readyQ.first = 0x%08x, set bmap[0] |= bit 28 "
-                "(was 0x%08x, now should be 0x%08x), set byte[28] |= 0x04\n",
-                TCB, pre_bmap0, pre_bmap0 | (1u << 28));
+        (void)bmap_w0;
         fflush(stderr);
     }
 
@@ -3415,43 +3450,25 @@ static void mpc5200_bestcomm_rx_hook(const uint8_t *buf, size_t len)
     s->fshook.netjob_func    = 0x002acf80;
 
     /*
-     * READYQ-FORCE-RX (plan 2026-05-11 step 3): the wake-once at vt=10s
-     * dispatched tFecEndRx ONCE (PC moved 0x002fe918 → 0x00175628 at
-     * the post-windExit return point). After that, readyQ.first stays 0
-     * and tFecEndRx never gets re-dispatched even though TCB.status is
-     * READY — the kernel doesn't re-enqueue it when context-switching
-     * out (our forced bmap state is inconsistent with the bucket FIFO).
+     * READYQ-FORCE-RX REMOVED (Layer-5, 2026-05-14):
+     * The previous brute-force write to readyQ.first / bmap[0] bit 28 /
+     * byte[28] bit 2 was a band-aid for the wedge that was actually
+     * caused by the QEMU MSR.ILE bug (fixed in
+     * `fix: scrub MSR.ILE on rfi for 6xx`). With that fix in place, the
+     * natural semGive on tFecEndRx_sem reaches the scheduler properly.
      *
-     * Brute-force on every RX-walker fire: re-write readyQ.first = TCB,
-     * re-set bmap[0] bit 28, re-set bmap_byte[28] bit 2, also clear
-     * TCB.status to READY (in case kernel set PEND between fires). This
-     * keeps the task continuously dispatchable so each new frame has a
-     * shot at being processed by the network stack.
+     * Worse, the hack ACTIVELY corrupted scheduler state: it wrote
+     * readyQ.first = TCB unconditionally, racing with the kernel's
+     * own qPriBMapPut/Get state machine. Result observed at t=16s after
+     * one curl SYN: readyQ.first=0x00000000 but bmap[0] bit 28 still
+     * set. The kernel's idle loop at 0x002fdfXX busy-waits on
+     * `*(0x0099AF58) == 0` and never dispatches anyone — including the
+     * idle task or tFecEndRx — burning all CPU on intUnlock isync.
+     *
+     * Removal is safe: semGive's normal path enqueues tFecEndRx
+     * correctly. If the BSP ever fails to call semGive on its own, the
+     * sysClkInt-tail-patch shim still wakes via qPriBMapPut.
      */
-    {
-        AddressSpace *as_force = &address_space_memory;
-        const uint32_t TCB_FECRX = 0x07bede38;
-        const uint32_t READYQ    = 0x0099af58;
-        uint32_t rqbmap = ldl_be_phys(as_force, READYQ + 0x04);
-        stl_be_phys(as_force, READYQ + 0x00, TCB_FECRX);
-        if (rqbmap) {
-            uint32_t b0 = ldl_be_phys(as_force, rqbmap + 0x00);
-            stl_be_phys(as_force, rqbmap + 0x00, b0 | (1u << 28));
-            uint32_t byte_off = rqbmap + 4 + 28;
-            uint8_t b;
-            cpu_physical_memory_read(byte_off, &b, 1);
-            b |= (1u << 2);
-            cpu_physical_memory_write(byte_off, &b, 1);
-        }
-        stl_be_phys(as_force, TCB_FECRX + 0x3C, 0);  /* status = READY */
-        static unsigned force_log = 0;
-        if (force_log++ < 8) {
-            fprintf(stderr,
-                    "READYQ-FORCE-RX: post-RX dispatch force #%u (skb=0x%08x)\n",
-                    force_log, skb_pa);
-            fflush(stderr);
-        }
-    }
 }
 
 /* Forward decl for the FEC -> BestComm RX hook installer. */
