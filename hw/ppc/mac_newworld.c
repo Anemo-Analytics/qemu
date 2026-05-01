@@ -1078,6 +1078,20 @@ static BootStation g_boot_stations[] = {
      * is sem-post (Phase 2). If it never hits despite SDMA RAISE in the
      * eval log, the problem is dispatch (Phase 1). */
     { 0x00132854, 0x00132857, "VX: SDMA Main ISR entry (0x132854)",      false, 0 },
+    /* SDMA mux-ISR W1C site: NIP=0x132890 stores (mask|cur) -> W1C
+     * clears ALL set IntPending bits. Then b 0x1192e0 dispatches only
+     * the LOWEST set bit (r3 = 54+bit_index). If bits 2 and 3 are both
+     * pending (FEC TX + FEC RX), only bit 2 dispatches; bit 3 is ACKed
+     * silently. Test 1 confirmed (plan 2026-05-13). */
+    { 0x00132890, 0x00132893, "VX: SDMA mux-ISR W1C store",              false, 0 },
+    { 0x00132894, 0x00132897, "VX: SDMA mux-ISR -> dispatcher (b 0x1192e0)", false, 0 },
+    /* Dispatcher entry (vector-table indirection). Reads handler ptr
+     * from 0x90E730 + r3*8 + 8, then bctrl. If 0x132890 hits but this
+     * never hits, the b-tail-call path is broken. If this hits but
+     * neither 0x12e294 (tFecEndRx) nor m5200FecInt fires, the table
+     * slot for IRQ 57 (FEC RX) holds a default no-op handler (H1). */
+    { 0x001192e0, 0x001192e3, "VX: SDMA dispatcher entry (vector lookup)", false, 0 },
+    { 0x0011932c, 0x0011932f, "VX: SDMA dispatcher pre-bctrl (handler call)", false, 0 },
 
     /* === sysClkInt tail-patch shim (plan 2026-05-06; updated 2026-05-07) ===
      * Stub @ 0x002acef0 fires once per ~17 ms tick — first hit confirms
@@ -1260,6 +1274,89 @@ static void mpc5200_diag_sample(void *opaque)
                     apmode_val, (unsigned)nip);
             fflush(stderr);
             last_apmode = apmode_val;
+        }
+    }
+
+    /*
+     * SDMA IRQ-vector-table walker (plan 2026-05-13 augment): read
+     * 16 SDMA-task slots from the dispatcher-base 0x0090E730. Each
+     * entry is 8 bytes; the dispatcher reads handler at +8 and arg at
+     * +12 from base + irq*8 (so for irq 53..69 the actual entry sits
+     * at base + irq*8 + 8). Print once per second while the table is
+     * still changing, then stop. If slot 57 (FEC RX) holds a default
+     * no-op or NULL even after m5200FecEndLoad has run, that's H1.
+     */
+    {
+        static uint32_t last_h[17], last_a[17];
+        static int vec_tick = 0;
+        static int vec_stable_count = 0;
+        if (++vec_tick >= 5000) { /* 5000 × 100us = 0.5 s */
+            vec_tick = 0;
+            bool any_change = false;
+            uint32_t h_buf[17], a_buf[17];
+            for (int k = 0; k <= 16; k++) {
+                int irq = 53 + k;
+                hwaddr ent = 0x0090E730UL + (uint32_t)irq * 8U;
+                h_buf[k] = ldl_be_phys(&address_space_memory, ent + 8);
+                a_buf[k] = ldl_be_phys(&address_space_memory, ent + 12);
+                if (h_buf[k] != last_h[k] || a_buf[k] != last_a[k]) {
+                    any_change = true;
+                }
+            }
+            if (any_change && vec_stable_count < 4) {
+                fprintf(stderr, "SDMA-VEC table @ 0x90E730 (t=%ds):\n",
+                        diag_count / 10000);
+                for (int k = 0; k <= 16; k++) {
+                    int irq = 53 + k;
+                    const char *tag = "";
+                    if (irq == 57) tag = " <- FEC RX (bit3)";
+                    if (irq == 56) tag = " <- FEC TX (bit2)";
+                    fprintf(stderr,
+                            "  IRQ %2d: handler=0x%08x arg=0x%08x%s\n",
+                            irq, h_buf[k], a_buf[k], tag);
+                    last_h[k] = h_buf[k];
+                    last_a[k] = a_buf[k];
+                }
+                fflush(stderr);
+                vec_stable_count = 0;
+            } else if (!any_change) {
+                vec_stable_count++;
+            }
+        }
+    }
+
+    /*
+     * tFecEndRx_sem watcher (plan 2026-05-13, Test 2c): raw 32-byte dump
+     * of the sem-block at 0x07bee080 every ~1 s. If `semGive(tFecEndRx)`
+     * ever fires, the count/queue fields (typically near the head) will
+     * change. If they NEVER change despite the SDMA mux-ISR W1C-acking
+     * bit 3 (FEC RX) IRQs, that is decisive evidence that the bit-3
+     * handler is not being dispatched (H1 / H2).
+     */
+    {
+        static int sem_tick = 0;
+        static uint32_t last_w0, last_w1, last_w2, last_w3;
+        static bool sem_first = true;
+        if (++sem_tick >= 10000) { /* 10000 × 100us = 1 s */
+            sem_tick = 0;
+            uint32_t w0 = ldl_be_phys(&address_space_memory, 0x07bee080);
+            uint32_t w1 = ldl_be_phys(&address_space_memory, 0x07bee084);
+            uint32_t w2 = ldl_be_phys(&address_space_memory, 0x07bee088);
+            uint32_t w3 = ldl_be_phys(&address_space_memory, 0x07bee08c);
+            bool changed = sem_first ||
+                           (w0 != last_w0) || (w1 != last_w1) ||
+                           (w2 != last_w2) || (w3 != last_w3);
+            if (changed) {
+                fprintf(stderr,
+                        "FECRX-SEM @ 0x07bee080: %08x %08x %08x %08x  "
+                        "(t=%ds %s)\n",
+                        w0, w1, w2, w3,
+                        diag_count / 10000,
+                        sem_first ? "init" : "CHANGED");
+                fflush(stderr);
+                sem_first = false;
+                last_w0 = w0; last_w1 = w1; last_w2 = w2; last_w3 = w3;
+            }
         }
     }
 
@@ -3005,6 +3102,77 @@ static void mpc5200_bestcomm_rx_hook(const uint8_t *buf, size_t len)
             taskbar, var, bd_addr, skb_pa, len);
     fflush(stderr);
 
+    /*
+     * BSP-vs-QEMU BD-ring divergence check (plan 2026-05-13 augment).
+     * Test 2 showed handler 0x0012e7e4 (FEC RX) hangs at NIP 0x12e4c8
+     * (lhzx r10, r29, r30) inside its BD walker. r29 is loaded from
+     * arg+856 (= 0x07ccb860 + 0x358 = 0x07ccbbb8). If r29 != bd_base,
+     * the BSP walker is reading from a different ring than we are
+     * writing to, which would explain the infinite loop. Log one-shot.
+     * Also dump first 4 BD slot status words from BOTH rings.
+     *
+     * 2nd-pass extension: also log per-RX walker cursor (arg+792) and
+     * a 6-BD snapshot, so we can see whether the walker advances
+     * between successive RX deliveries.
+     */
+    {
+        static unsigned ring_per_rx = 0;
+        if (ring_per_rx++ < 8) {
+            uint32_t r6 = ldl_be_phys(&address_space_memory,
+                                       0x07ccb860 + 792);
+            uint32_t s0 = ldl_be_phys(&address_space_memory, bd_base + 0);
+            uint32_t s1 = ldl_be_phys(&address_space_memory, bd_base + 8);
+            uint32_t s2 = ldl_be_phys(&address_space_memory, bd_base + 16);
+            uint32_t s3 = ldl_be_phys(&address_space_memory, bd_base + 24);
+            uint32_t s4 = ldl_be_phys(&address_space_memory, bd_base + 32);
+            uint32_t s5 = ldl_be_phys(&address_space_memory, bd_base + 40);
+            fprintf(stderr,
+                    "BD-RING-LIVE[%u] (pre-write): walker_r6=%u  "
+                    "BDs[0..5]: %08x %08x %08x %08x %08x %08x  "
+                    "(QEMU bd_start=0x%08x)\n",
+                    ring_per_rx, r6, s0, s1, s2, s3, s4, s5, bd_start);
+            fflush(stderr);
+        }
+        static bool ring_dumped = false;
+        if (!ring_dumped) {
+            ring_dumped = true;
+            uint32_t bsp_r29 =
+                ldl_be_phys(&address_space_memory, 0x07ccbbb8);
+            fprintf(stderr,
+                    "BD-RING-CHECK: QEMU bd_base=0x%08x bd_last=0x%08x "
+                    "bd_start=0x%08x  BSP r29=*(0x07ccbbb8)=0x%08x  %s\n",
+                    bd_base, bd_last, bd_start, bsp_r29,
+                    (bsp_r29 == bd_base) ? "MATCH"
+                    : "DIVERGENT (walker reads wrong ring!)");
+            for (int k = 0; k < 6; k++) {
+                uint32_t qa = bd_base + (uint32_t)k * BCOM_FEC_BD_STRIDE;
+                uint32_t qs = ldl_be_phys(&address_space_memory, qa);
+                uint32_t qd = ldl_be_phys(&address_space_memory, qa + 4);
+                uint32_t ba = bsp_r29 + (uint32_t)k * 8U;
+                uint32_t bs = ldl_be_phys(&address_space_memory, ba);
+                uint32_t bd = ldl_be_phys(&address_space_memory, ba + 4);
+                fprintf(stderr,
+                        "  BD[%d]: QEMU @0x%08x stat=0x%08x dat=0x%08x"
+                        "   |   BSP @0x%08x stat=0x%08x dat=0x%08x\n",
+                        k, qa, qs, qd, ba, bs, bd);
+            }
+            /* Also dump arg-struct fields the walker uses:
+             *   arg+856 (r29 base), arg+868 (r31), arg+940 (r4 cfg),
+             *   arg+792 (r6 = current BD index), arg+892 (r5 cnt).
+             */
+            fprintf(stderr,
+                    "  arg=0x07ccb860: +856=0x%08x +868=0x%08x +940=0x%08x"
+                    " +792=0x%08x +892=0x%08x +956=0x%08x\n",
+                    ldl_be_phys(&address_space_memory, 0x07ccb860 + 856),
+                    ldl_be_phys(&address_space_memory, 0x07ccb860 + 868),
+                    ldl_be_phys(&address_space_memory, 0x07ccb860 + 940),
+                    ldl_be_phys(&address_space_memory, 0x07ccb860 + 792),
+                    ldl_be_phys(&address_space_memory, 0x07ccb860 + 892),
+                    ldl_be_phys(&address_space_memory, 0x07ccb860 + 956));
+            fflush(stderr);
+        }
+    }
+
     /* Copy the frame into the BD's skb_pa buffer in DRAM. */
     cpu_physical_memory_write(skb_pa, buf, len);
 
@@ -3234,8 +3402,29 @@ static void mpc5200_mmio_write(void *opaque, hwaddr offset,
          * `stw (1<<taskID), MBAR+0x1214` to acknowledge a task IRQ.
          */
         if (offset == 0x1214 && size == 4) {
-            uint32_t cur = mpc5200_bc_get32(s, 0x14);
+            uint32_t cur  = mpc5200_bc_get32(s, 0x14);
             uint32_t bits = (uint32_t)v;
+            /*
+             * INTP-W1C tap (plan 2026-05-13, Test 2a): log the LR + NIP + MSR.EE
+             * on every IntPending W1C write. NIP=0x132890 is the SDMA mux-ISR
+             * store; LR identifies who called the mux-ISR (i.e. whether it was
+             * reached via the EXT-IRQ vector or via some BSP poll-from-thread).
+             */
+            {
+                static unsigned w1c_log = 0;
+                if (w1c_log++ < 64) {
+                    target_ulong nip = s->cpu->env.nip;
+                    target_ulong lr  = s->cpu->env.lr;
+                    uint32_t msr = (uint32_t)s->cpu->env.msr;
+                    fprintf(stderr,
+                            "INTP-W1C[%u]: clear=0x%08x cur=0x%08x next=0x%08x"
+                            " NIP=0x%08x LR=0x%08x MSR.EE=%d\n",
+                            w1c_log, bits, cur, cur & ~bits,
+                            (unsigned)nip, (unsigned)lr,
+                            (msr & (1u<<15)) ? 1 : 0);
+                    fflush(stderr);
+                }
+            }
             mpc5200_bc_put32(s, 0x14, cur & ~bits);
             mpc5200_sdma_eval_irq(s);
             return;
