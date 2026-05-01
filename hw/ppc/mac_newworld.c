@@ -2762,14 +2762,28 @@ static uint64_t mpc5200_mmio_read(void *opaque, hwaddr offset, unsigned size)
         return v;
     }
 
-    /* BestComm/SDMA register file: byte-addressable RAM. Big-endian. */
+    /* BestComm/SDMA register file: byte-addressable RAM. Big-endian.
+     *
+     * Endianness fix (plan 2026-05-13 Test 3): the previous code did
+     * `return v << (8 * (4 - size))` to "MSB-align for BE", but QEMU
+     * MemoryRegion semantics with .endianness = DEVICE_BIG_ENDIAN
+     * already expect the value in the LOW bits of the returned uint64_t
+     * (matching the access size). The MSB-shift caused halfword/byte
+     * reads to land in the wrong position. The BSP's FEC RX BD walker
+     * (`lhzx r10, r29, r30` at NIP 0x12e4c8) was the visible victim:
+     * it read BD status hi-halfword as 0x40000000 instead of 0x4000,
+     * then `andi. r9, r10, 0x4000` masked to 0, looking like READY=0
+     * (CPU-owned, has frame), so the walker processed and re-armed
+     * EVERY BD in the ring forever instead of exiting on a still-
+     * armed BD.
+     */
     if (offset >= 0x1200 && offset < 0x1300) {
         unsigned i = offset - 0x1200;
         uint64_t v = 0;
         for (unsigned k = 0; k < size && (i + k) < 0x100; k++) {
             v = (v << 8) | s->bestcomm[i + k];
         }
-        return v << (8 * (4 - size)); /* MSB-align the result for BE */
+        return v;
     }
     /* MPC5200 internal SRAM (MBAR+0x8000..0xBFFF, 16 KiB per manual §13.13) */
     if (offset >= 0x8000 && offset < 0xC000) {
@@ -2778,7 +2792,7 @@ static uint64_t mpc5200_mmio_read(void *opaque, hwaddr offset, unsigned size)
         for (unsigned k = 0; k < size && (i + k) < sizeof(s->sram); k++) {
             v = (v << 8) | s->sram[i + k];
         }
-        return v << (8 * (4 - size));
+        return v;
     }
     /*
      * I2C1 (MBAR+0x3D00..0x3D14): no real chip behind it. Provide
