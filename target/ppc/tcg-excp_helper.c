@@ -496,6 +496,22 @@ static void do_rfi(CPUPPCState *env, target_ulong nip, target_ulong msr)
         msr &= ~(1ULL << MSR_TGPR);
     }
 
+    /*
+     * Layer-3 plan #1 (2026-05-14, mpc5200-stub): on 603/e300 the
+     * QEMU MMU layer sets `error_code = 1 << 16` for DSTLB miss to
+     * signal "Store" to the BSP. That bit position is also MSR_ILE
+     * in QEMU's MSR bit map. After the BSP's TLB-miss handler RFIs
+     * from SRR1, MSR.ILE ends up = 1, and the next exception delivery
+     * flips MSR.LE = 1 → vector code at 0x000 is fetched in LE → CPU
+     * decodes garbage at NIP=0x90c → HV_EMU → kernel collapse.
+     * BSP is big-endian and never intentionally sets MSR.ILE, so
+     * scrubbing it on RFI is safe for this platform. POWERPC_FLAG_TGPR
+     * is the same flag that already gates the MSR.TGPR scrub above.
+     */
+    if (env->flags & POWERPC_FLAG_TGPR) {
+        msr &= ~(1ULL << MSR_ILE);
+    }
+
 #ifdef TARGET_PPC64
     /* Switching to 32-bit ? Crop the nip */
     if (!msr_is_64bit(env, msr)) {
