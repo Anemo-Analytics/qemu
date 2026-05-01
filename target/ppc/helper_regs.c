@@ -377,6 +377,31 @@ int hreg_store_msr(CPUPPCState *env, target_ulong value, int alter_hv)
                 ile_log_count);
             fflush(stderr);
         }
+        /* Layer-4 plan (2026-05-14): track MSR.PR (problem-state)
+         * transitions. After the ILE fix, kernel jumps to NIP=0 at
+         * vt~13s with MSR=0xd850 (PR=1, IR=0) — an impossible
+         * combination for sane user code. Find who flips PR on. */
+        static unsigned pr_log_count;
+        if (((last_msr ^ value) & (1ULL << MSR_PR)) && pr_log_count++ < 64) {
+            uint8_t code_buf[64];
+            cpu_physical_memory_read(0, code_buf, sizeof(code_buf));
+            fprintf(stderr,
+                "MSR.PR %d -> %d  nip=0x%08x lr=0x%08x ctr=0x%08x "
+                "srr0=0x%08x srr1=0x%08x msr_old=0x%08x msr_new=0x%08x [%u]\n",
+                (int)((last_msr >> MSR_PR) & 1),
+                (int)((value    >> MSR_PR) & 1),
+                (uint32_t)env->nip, (uint32_t)env->lr, (uint32_t)env->ctr,
+                (uint32_t)env->spr[SPR_SRR0], (uint32_t)env->spr[SPR_SRR1],
+                (uint32_t)last_msr, (uint32_t)value,
+                pr_log_count);
+            fprintf(stderr, "  PA[0x000..0x040]:");
+            for (int q = 0; q < 64; q++) {
+                if (q % 16 == 0) fprintf(stderr, "\n    ");
+                fprintf(stderr, " %02x", code_buf[q]);
+            }
+            fprintf(stderr, "\n");
+            fflush(stderr);
+        }
         last_msr = value;
     }
 #endif
