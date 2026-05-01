@@ -1141,6 +1141,17 @@ static BootStation g_boot_stations[] = {
     { 0x00177b34, 0x00177b37, "VX: tRootTask post-wake (after wedge)",   false, 0 },
     { 0x0017de2c, 0x0017de2f, "VX: ftpdTask-created printf (in ftpdInit)", false, 0 },
 
+    /* === Layer-6 wedge: FEC restart hunt (plan 2026-05-14) ===
+     * The BSP at vt~14s calls semDelete on FEC RX sem, killing
+     * tFecEndRx. Find the call chain that triggers this. */
+    { 0x0012b8b4, 0x0012b8b7, "VX: FEC teardown helper entry",            false, 0 },
+    { 0x0012b9e0, 0x0012b9e3, "VX: FEC teardown bl 0x2ff730 (semTake 300)", false, 0 },
+    { 0x0012ba7c, 0x0012ba7f, "VX: FEC teardown bl 0x2ff9f4 (semDelete sem1)", false, 0 },
+    { 0x0012ba90, 0x0012ba93, "VX: FEC teardown bl 0x2ff9f4 (semDelete sem2)", false, 0 },
+    { 0x0012da98, 0x0012da9b, "VX: FEC ioctl(?) caller of teardown",      false, 0 },
+    { 0x0012de58, 0x0012de5b, "VX: FEC unload(?) caller of teardown",     false, 0 },
+    { 0x0012d850, 0x0012d853, "VX: FEC ioctl/stop function entry",        false, 0 },
+
     /* === Layer-3 wedge: post-walker FEC RX chain stations (plan
      * 2026-05-14 Test 2). After Test 1 confirmed sem 0x07bee080 NEVER
      * gets a semGive post-boot, we need to know how far the handler
@@ -1229,6 +1240,7 @@ static void mpc5200_diag_sample(void *opaque)
     target_ulong nip = s->cpu->env.nip;
     target_ulong msr = s->cpu->env.msr;
     target_ulong dec = s->cpu->env.spr[SPR_DECR];
+    target_ulong lr  = s->cpu->env.lr;
 
     /* Detect first hit on each boot station */
     for (i = 0; i < (int)(sizeof(g_boot_stations) / sizeof(g_boot_stations[0]));
@@ -1237,8 +1249,9 @@ static void mpc5200_diag_sample(void *opaque)
         if (!bs->hit && nip >= bs->addr && nip <= bs->addr_end) {
             bs->hit = true;
             fprintf(stderr,
-                    "STATION HIT [%2d] @ NIP=0x%08x MSR=0x%08x DEC=0x%08x : %s\n",
-                    i, (unsigned)nip, (unsigned)msr, (unsigned)dec, bs->name);
+                    "STATION HIT [%2d] @ NIP=0x%08x MSR=0x%08x DEC=0x%08x LR=0x%08x : %s\n",
+                    i, (unsigned)nip, (unsigned)msr, (unsigned)dec,
+                    (unsigned)lr, bs->name);
             fflush(stderr);
         }
     }
