@@ -39,6 +39,9 @@
 #include "qemu/log.h"
 #include "qemu/module.h"
 #include "qapi/error.h"
+#include "qemu/bswap.h"
+#include "qemu/timer.h"
+#include "hw/core/cpu.h"
 #include "hw/irq.h"
 #include "hw/qdev-properties.h"
 #include "hw/sysbus.h"
@@ -329,6 +332,32 @@ static void mpc5200_fec_write(void *opaque, hwaddr offset,
                     (unsigned)offset, v, size);
             fflush(stderr);
         }
+        /* Layer-7 tap: identify ECR=0 writer post-vt=10s.
+         * mpc5200_fec.c is common code, so we go through generic
+         * CPUClass hooks rather than CPUPPCState. PC via cc->get_pc;
+         * LR via gdb_read_register (PPC reg 67). */
+        if (offset == 0x024) {
+            int64_t ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+            if (ns > 10000000000LL && current_cpu) {
+                CPUState *cs = current_cpu;
+                uint32_t nip = 0, lr = 0;
+                if (cs->cc->get_pc) {
+                    nip = (uint32_t)cs->cc->get_pc(cs);
+                }
+                if (cs->cc->gdb_read_register) {
+                    GByteArray *buf = g_byte_array_new();
+                    int n = cs->cc->gdb_read_register(cs, buf, 67);
+                    if (n >= 4) {
+                        lr = ldl_be_p(buf->data + buf->len - 4);
+                    }
+                    g_byte_array_free(buf, TRUE);
+                }
+                fprintf(stderr,
+                    "FEC-ECR-WRITE: val=0x%08x NIP=0x%08x LR=0x%08x vt_ns=%lld\n",
+                    v, nip, lr, (long long)ns);
+                fflush(stderr);
+            }
+        }
     }
 
     switch (offset) {
@@ -344,6 +373,24 @@ static void mpc5200_fec_write(void *opaque, hwaddr offset,
         break;
 
     case FEC_ECR:
+        /*
+         * Layer-7 BSP-side teardown filter: ZTC (zeroTouchNetworkConfigureStr)
+         * calls sysFecEnetDisable at vt~11.7s and writes ECR=0, which would
+         * disable the FEC and stop all RX delivery. We don't actually need
+         * teardown for the QEMU sim, so ignore plain ECR=0 writes once the
+         * FEC has been enabled at least once. Boot-time RESET (bit 0) and
+         * normal enable transitions still go through.
+         */
+        if (v == 0 && (s->regs[idx] & ECR_ETHER_EN)) {
+            static unsigned ecr0_count = 0;
+            if (ecr0_count++ < 8) {
+                fprintf(stderr,
+                    "FEC: ignoring ECR=0 write (BSP teardown filter, hit #%u)\n",
+                    ecr0_count);
+                fflush(stderr);
+            }
+            break;
+        }
         s->regs[idx] = v;
         if (v & ECR_RESET) {
             /* Soft reset: drop ETHER_EN and clear all interrupt state. */
