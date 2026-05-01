@@ -1943,6 +1943,52 @@ static void mpc5200_tick(void *opaque)
      * Guarded with `sem_queue == 0` so we don't clobber the FEC RX post
      * at vt=8s. Each post is consumed within ~17ms (one sysClkInt tick).
      */
+    /*
+     * Layer-6 plan (2026-05-14): one-shot dump of tFecEndRecover task
+     * info — entry function at TCB+0x74, the timeout sem ID, and the
+     * struct it polls for FEC restart triggers.
+     */
+    if (tick_count == 60 * 8) {
+        AddressSpace *as_rec = &address_space_memory;
+        const uint32_t TCB_REC = 0x07ccb5f0;
+        uint32_t entry  = ldl_be_phys(as_rec, TCB_REC + 0x74);
+        uint32_t arg0   = ldl_be_phys(as_rec, TCB_REC + 0x78);
+        uint32_t arg1   = ldl_be_phys(as_rec, TCB_REC + 0x7C);
+        uint32_t prio   = ldl_be_phys(as_rec, TCB_REC + 0x40);
+        uint32_t status = ldl_be_phys(as_rec, TCB_REC + 0x3C);
+        uint32_t pSemId = ldl_be_phys(as_rec, TCB_REC + 0x5C);
+        uint32_t pc     = ldl_be_phys(as_rec, TCB_REC + 0x130 + 0x8C);
+        fprintf(stderr,
+            "FECRECOVER-INFO: tcb=0x%08x entry=0x%08x arg0=0x%08x "
+            "arg1=0x%08x prio=%u status=0x%x pSemId=0x%08x savedPC=0x%08x\n",
+            TCB_REC, entry, arg0, arg1, prio, status, pSemId, pc);
+        fflush(stderr);
+    }
+
+    /*
+     * Layer-6 plan (2026-05-14): periodic FEC state watcher.
+     * tFecEndRecover walks a list anchored at 0x0090E2E0 (= lis r31,
+     * 145; addi r31, r31, -3628 from 0x12cd34). Each FEC has state at
+     * offset +848. Log changes only.
+     */
+    {
+        static uint32_t last_state = 0xDEADBEEF;
+        AddressSpace *as_st = &address_space_memory;
+        uint32_t fec_head = ldl_be_phys(as_st, 0x0090E2E0);
+        uint32_t state = fec_head ? ldl_be_phys(as_st, fec_head + 848) : 0;
+        if (state != last_state) {
+            fprintf(stderr,
+                "FEC-STATE: head=0x%08x +848=%u (was %u) at tick=%d "
+                "[NIP=0x%08x LR=0x%08x]\n",
+                fec_head, state,
+                last_state == 0xDEADBEEF ? 0 : last_state,
+                tick_count,
+                (uint32_t)s->cpu->env.nip, (uint32_t)s->cpu->env.lr);
+            fflush(stderr);
+            last_state = state;
+        }
+    }
+
     /* Layer-4 plan (2026-05-14): fire ROOTTASK-DOORBELL only ONCE.
      *
      * Repeated firings after the first cause a different wedge: after
