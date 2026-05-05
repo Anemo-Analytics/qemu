@@ -819,48 +819,55 @@ static void mpc5200_apply_keyswitch_patches(void)
                                   sizeof(nop_bytes));
 
         /*
-         * NETJOB-PROBE / RX-wake stub at 0x002acf80 (LR-safe). Run in
-         * netTask context (via netJobAdd deferred-call). Does:
-         *   1. Save caller LR in r12 (volatile per PPC ABI; same idiom as
-         *      sysClkInt shim).
-         *   2. Write flag=8 at 0x07BEDD04 (= struct+848 for tFecEndRx). This
+         * NETJOB-PROBE / RX-wake stub at 0x002acf80. Run in netTask context
+         * (via netJobAdd deferred-call). Does:
+         *   1. Write flag=8 at 0x07BEDD04 (= struct+848 for tFecEndRx). This
          *      makes tFecEndRx's main loop take the work-path on wake instead
          *      of falling through to cleanup-and-exit.
-         *   3. Call semGive(0x07bee080) — proper kernel wake of tFecEndRx, in
-         *      netTask (EE=1) context, so semGive can dispatch the scheduler.
-         *   4. Restore caller LR from r12, then blr.
-         * 10 insns / 40 bytes. semGive @ 0x002ff5c4. Stub ends at 0x002acfa8,
-         * 8 bytes clear of the live function at 0x002acfb0.
+         *   2. Clear TCB.status (offset 0x3C) = 0 (READY) on the tFecEndRx
+         *      TCB at 0x07BEDE38, and clear TCB.pSemId (offset 0x5C) = 0.
+         *      Same kernel-private fields the sysClkInt shim's per-sem
+         *      dispatch path manipulates before qPriBMapPut.
+         *   3. Tail-`b` into qPriBMapPut(0x002cd8e0) with r4=tFecEndRx_TCB.
+         *      qPriBMapPut inserts the TCB into the priority-mapped ready
+         *      queue; the next reschedule (DECR or yield) picks it up and
+         *      tFecEndRx resumes from its semTake.
+         * 10 insns / 40 bytes. Stub ends at 0x002acfa8, 8 bytes clear of
+         * live function at 0x002acfb0.
          *
-         * The previous stub had an LR-loop bug: `bl semGive` set LR to
-         * probe+0x30, semGive's epilogue restored that, then the trailing
-         * blr branched right back to itself — pinning tNetTask in a loop
-         * that only DECR preempt could escape, so the netjob doorbell got
-         * armed exactly once instead of once per RX. mflr/mtlr fixes that.
+         * Layer-8 F3 fix (plan 2026-05-15, applied 2026-05-05): replaces
+         * the previous mflr/bl-semGive/mtlr/blr scheme. The sharpened
+         * Phase 1B test (test46 PROBE-RET marker) proved bl semGive never
+         * returned to its caller — semGive entered but did not complete
+         * the round-trip, leaving tFecEndRx unwoken. Bypassing semGive
+         * entirely and using qPriBMapPut directly mirrors the sysClkInt
+         * shim's per-sem dispatch (mac_newworld.c:696–737), which is the
+         * known-good wake path for tFecEndRx via the timer route.
          *
-         * Dropped: the 0xCAFEBABE write to MMIO 0xF0004038 (one-shot debug
-         * visibility — we have READYQ-FORCE-RX, BestComm RX, station hits
-         * as alternate signals).
+         * The new stub does not save/restore LR — the trailing `b
+         * qPriBMapPut` is a tail-call, and qPriBMapPut's blr returns to
+         * netTask's call site (netJob loop's own LR-save).
          *
          * The flag location 0x07BEDD04 = struct_ptr 0x07BED9B4 + 848.
          * struct_ptr back-computed from sem ID 0x07bee080 stored at
          * struct+1248 (per disasm of tFecEndRx entry @ 0x12e294).
+         * tFecEndRx TCB at 0x07BEDE38 = struct+0x484 (per task-list dump).
          */
         const uint32_t probe_addr = 0x002acf80;
-        const uint32_t semgive_addr = 0x002ff5c4;
-        uint32_t bl_semgive =
-            0x48000000u | ((semgive_addr - (probe_addr + 0x1C)) & 0x03FFFFFC) | 1u;
+        const uint32_t qpri_addr  = 0x002cd8e0;
+        uint32_t b_qpri = 0x48000000u
+            | ((qpri_addr - (probe_addr + 0x24)) & 0x03FFFFFCu);
         const uint32_t probe_words[10] = {
-            0x7d8802a6,    /* +0x00  mflr  r12 (save caller's LR)           */
-            0x3d2007be,    /* +0x04  lis   r9,  0x07BE                      */
-            0x6129dd04,    /* +0x08  ori   r9,  r9, 0xDD04 (= 0x07BEDD04)   */
-            0x39400008,    /* +0x0C  li    r10, 8                            */
-            0x91490000,    /* +0x10  stw   r10, 0(r9) (flag = 8)             */
-            0x3c6007be,    /* +0x14  lis   r3,  0x07BE                      */
-            0x6063e080,    /* +0x18  ori   r3,  r3, 0xE080 (sem ID)         */
-            bl_semgive,    /* +0x1C  bl    0x002ff5c4 (semGive)              */
-            0x7d8803a6,    /* +0x20  mtlr  r12 (restore caller's LR)        */
-            0x4e800020,    /* +0x24  blr                                     */
+            0x3d2007be,    /* +0x00  lis   r9,  0x07BE                       */
+            0x6129dd04,    /* +0x04  ori   r9,  r9, 0xDD04 (= 0x07BEDD04)    */
+            0x39400008,    /* +0x08  li    r10, 8                             */
+            0x91490000,    /* +0x0C  stw   r10, 0(r9) (work-flag = 8)         */
+            0x3c8007bf,    /* +0x10  lis   r4,  0x07BF                        */
+            0x3884de38,    /* +0x14  addi  r4,  r4, -0x21C8 (= 0x07BEDE38)    */
+            0x38000000,    /* +0x18  li    r0,  0                             */
+            0x9004003c,    /* +0x1C  stw   r0,  0x3C(r4) (TCB.status=READY)  */
+            0x9004005c,    /* +0x20  stw   r0,  0x5C(r4) (TCB.pSemId=NULL)   */
+            b_qpri,        /* +0x24  b     qPriBMapPut (tail call)            */
         };
         uint8_t probe_bytes[sizeof(probe_words)];
         for (unsigned i = 0; i < ARRAY_SIZE(probe_words); i++) {
@@ -904,10 +911,11 @@ static void mpc5200_apply_keyswitch_patches(void)
                 "%02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x "
                 "%02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x "
                 "%02x%02x%02x%02x %02x%02x%02x%02x "
-                "(expect mflr r12 = 7d8802a6, lis r9,0x07BE = 3d2007be, "
-                "ori = 6129dd04, li r10,8 = 39400008, stw r10,0(r9) = 91490000, "
-                "lis r3,0x07BE = 3c6007be, ori = 6063e080, bl semGive, "
-                "mtlr r12 = 7d8803a6, blr = 4e800020); "
+                "(expect lis r9,0x07BE = 3d2007be, ori = 6129dd04, "
+                "li r10,8 = 39400008, stw r10,0(r9) = 91490000, "
+                "lis r4,0x07BF = 3c8007bf, addi r4,r4,-0x21C8 = 3884de38, "
+                "li r0,0 = 38000000, stw r0,0x3C(r4) = 9004003c, "
+                "stw r0,0x5C(r4) = 9004005c, b qPriBMapPut); "
                 "0x001791a8 = %02x%02x%02x%02x (expect nop = 60000000, "
                 "was bctrl = 4e800421); "
                 "0x001791dc = %02x%02x%02x%02x (expect nop = 60000000, "
@@ -1026,8 +1034,9 @@ static void mpc5200_apply_keyswitch_patches(void)
             "nopped excExcHandle bctrl @ 0x001791a8 + 0x001791dc (skips all "
             "hook-handler calls at both indirect-call sites to avoid "
             "NULL-fn-ptr crashes); "
-            "probe stub @ 0x002acf80 (wakes tFecEndRx via mflr/bl semGive/"
-            "mtlr/blr -- LR-safe)\n",
+            "probe stub @ 0x002acf80 (Layer-8 F3: wakes tFecEndRx via "
+            "TCB.status=0 + TCB.pSemId=0 + tail-b qPriBMapPut @ 0x002cd8e0; "
+            "10 insns, work-flag=8 marker at 0x07BEDD04)\n",
             fshook_root());
     fflush(stderr);
 }
@@ -2328,10 +2337,10 @@ static void mpc5200_tick(void *opaque)
             ? ldl_be_phys(as_nj, nj_free) : 0;
         uint32_t slot_func = (nj_free != 0)
             ? ldl_be_phys(as_nj, nj_free + 4) : 0;
-        /* PROBE-MARKER (post-Phase-A plan Test 2): probe stub at 0x002acf80
-         * writes 8 to *(0x07BEDD04) at its +0x10 instruction. If our shim's
-         * `b` at +0x34 actually transfers control when redirected to the
-         * probe stub, this byte flips to 0x00000008. */
+        /* PROBE-MARKER (post-Phase-A plan Test 2): F3 probe stub at
+         * 0x002acf80 writes 8 to *(0x07BEDD04) at its +0x0C instruction
+         * (work-flag). If the stub got dispatched, this byte flips to
+         * 0x00000008. */
         uint32_t fec_flag = ldl_be_phys(as_nj, 0x07BEDD04);
         fprintf(stderr,
                 "NETJOB-WATCH: t=%d.%02ds netjob_func=0x%08x njcount=%u "
